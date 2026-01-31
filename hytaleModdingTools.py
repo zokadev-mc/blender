@@ -183,18 +183,28 @@ def get_templates_list(self, context):
         items.append(('NONE', "Sin referencias", "Carpeta 'templates' vacía"))
     return items
 
-# ==========================================
-#       LÓGICA DE EXPORTACIÓN
-# ==========================================
+# --- LÓGICA DE EXPORTACIÓN OPTIMIZADA ---
+
+def clean_num(n):
+    """Si el número es 2.0 devuelve 2, si es 2.5 devuelve 2.5"""
+    n = round(n, 4) # Mantenemos 4 decimales de precisión
+    return int(n) if n.is_integer() else n
 
 def blender_to_hytale_pos(vec):
     x = vec.x * FIXED_GLOBAL_SCALE
     y = vec.z * FIXED_GLOBAL_SCALE 
     z = -vec.y * FIXED_GLOBAL_SCALE 
-    return {"x": round(x, 4), "y": round(y, 4), "z": round(z, 4)}
+    # Usamos clean_num en lugar de solo round
+    return {"x": clean_num(x), "y": clean_num(y), "z": clean_num(z)}
 
 def blender_to_hytale_quat(quat):
-    return {"x": quat.x, "y": quat.z, "z": -quat.y, "w": quat.w}
+    # Los cuaterniones son sensibles, usamos 5 decimales pero limpiamos ceros
+    return {
+        "x": clean_num(quat.x), 
+        "y": clean_num(quat.z), 
+        "z": clean_num(-quat.y), 
+        "w": clean_num(quat.w)
+    }
 
 def get_face_name_dominant(normal):
     x, y, z = normal.x, normal.y, normal.z
@@ -869,12 +879,33 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            json_str = json.dumps(final_json, indent=4)
-            # Limpieza visual de vectores (opcional)
-            json_str = re.sub(r'\{\s+"x":\s*([^{}\[\]]+?),\s+"y":\s*([^{}\[\]]+?),\s+"z":\s*([^{}\[\]]+?)\s+\}', r'{"x": \1, "y": \2, "z": \3}', json_str)
+            # --- BLOQUE NUEVO (Compacto Fijo) ---
+            import re # Aseguramos disponibilidad
 
-            with open(output_path, 'w') as f:
+            # 1. Generamos JSON con indentación ligera (2 espacios ahorran mucho texto)
+            json_str = json.dumps(final_json, indent=2)
+            
+            # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
+            # Busca patrones verticales y los aplasta horizontalmente
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 3. OPTIMIZACIÓN: Colapsar Cuaterniones {x,y,z,w}
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+),\s*"w":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3, "w": \4}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 4. Escritura y Reporte de Peso
+            with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
+                
             self.report({'INFO'}, f"Exportado exitosamente: {output_path}")
 
         except Exception as e:
