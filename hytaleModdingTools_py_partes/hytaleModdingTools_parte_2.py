@@ -370,12 +370,33 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            json_str = json.dumps(final_json, indent=4)
-            # Limpieza visual de vectores (opcional)
-            json_str = re.sub(r'\{\s+"x":\s*([^{}\[\]]+?),\s+"y":\s*([^{}\[\]]+?),\s+"z":\s*([^{}\[\]]+?)\s+\}', r'{"x": \1, "y": \2, "z": \3}', json_str)
+            # --- BLOQUE NUEVO (Compacto Fijo) ---
+            import re # Aseguramos disponibilidad
 
-            with open(output_path, 'w') as f:
+            # 1. Generamos JSON con indentación ligera (2 espacios ahorran mucho texto)
+            json_str = json.dumps(final_json, indent=2)
+            
+            # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
+            # Busca patrones verticales y los aplasta horizontalmente
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 3. OPTIMIZACIÓN: Colapsar Cuaterniones {x,y,z,w}
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+),\s*"w":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3, "w": \4}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 4. Escritura y Reporte de Peso
+            with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
+                
             self.report({'INFO'}, f"Exportado exitosamente: {output_path}")
 
         except Exception as e:

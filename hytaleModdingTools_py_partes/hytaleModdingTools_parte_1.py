@@ -186,18 +186,28 @@ def get_templates_list(self, context):
         items.append(('NONE', "Sin referencias", "Carpeta 'templates' vacía"))
     return items
 
-# ==========================================
-#       LÓGICA DE EXPORTACIÓN
-# ==========================================
+# --- LÓGICA DE EXPORTACIÓN OPTIMIZADA ---
+
+def clean_num(n):
+    """Si el número es 2.0 devuelve 2, si es 2.5 devuelve 2.5"""
+    n = round(n, 4) # Mantenemos 4 decimales de precisión
+    return int(n) if n.is_integer() else n
 
 def blender_to_hytale_pos(vec):
     x = vec.x * FIXED_GLOBAL_SCALE
     y = vec.z * FIXED_GLOBAL_SCALE 
     z = -vec.y * FIXED_GLOBAL_SCALE 
-    return {"x": round(x, 4), "y": round(y, 4), "z": round(z, 4)}
+    # Usamos clean_num en lugar de solo round
+    return {"x": clean_num(x), "y": clean_num(y), "z": clean_num(z)}
 
 def blender_to_hytale_quat(quat):
-    return {"x": quat.x, "y": quat.z, "z": -quat.y, "w": quat.w}
+    # Los cuaterniones son sensibles, usamos 5 decimales pero limpiamos ceros
+    return {
+        "x": clean_num(quat.x), 
+        "y": clean_num(quat.z), 
+        "z": clean_num(-quat.y), 
+        "w": clean_num(quat.w)
+    }
 
 def get_face_name_dominant(normal):
     x, y, z = normal.x, normal.y, normal.z
