@@ -1,65 +1,68 @@
 # PARTE 3/3 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
-def update_target_texture(self, context):
+def update_target_material(self, context):
     """
-    Callback: Cuando se selecciona una imagen en el panel,
-    esta función la aplica automáticamente al material de los objetos.
+    Callback: Cuando seleccionas un material, se aplica automáticamente
+    a TODOS los objetos de la colección seleccionada.
     """
-    target_img = self.target_image
+    mat = self.target_material
     collection = self.target_collection
     
-    # Validaciones básicas
-    if not target_img: return
-    if not collection: return # Si no hay colección seleccionada, no hacemos nada
+    if not collection or not mat: return
         
-    collection = bpy.data.collections[col_name]
-    
     for obj in collection.objects:
         if obj.type == 'MESH':
-            # 1. Obtener o crear material
+            # Asignar el material en la ranura 0 (o crearla)
             if not obj.data.materials:
-                mat = bpy.data.materials.new(name=f"Hytale_{collection.name}_Mat")
                 obj.data.materials.append(mat)
             else:
-                mat = obj.data.materials[0]
-            
-            # 2. Activar nodos
-            mat.use_nodes = True
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
-            
-            # 3. Buscar el nodo Principled BSDF
-            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-            
-            # Si el material está vacío o roto, lo reconstruimos
-            if not bsdf:
-                nodes.clear()
-                bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-                bsdf.location = (0, 0)
-                out = nodes.new('ShaderNodeOutputMaterial')
-                out.location = (300, 0)
-                links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-            
-            # 4. Configurar el nodo de Textura
-            tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
-            if not tex_node:
-                tex_node = nodes.new('ShaderNodeTexImage')
-                tex_node.location = (-300, 200)
-            
-            # Asignar la imagen seleccionada
-            tex_node.image = target_img
-            tex_node.interpolation = 'Closest' # Importante para Pixel Art/Minecraft style
-            
-            # 5. Conectar al Base Color y Alpha
-            if 'Base Color' in bsdf.inputs:
-                links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-            
-            if 'Alpha' in bsdf.inputs:
-                links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-                # Activar transparencia en el material para viewport
-                mat.blend_method = 'CLIP'
-                mat.shadow_method = 'CLIP'
+                obj.data.materials[0] = mat
+
+def update_target_texture(self, context):
+    """
+    Callback: Aplica la imagen seleccionada al nodo de textura del 'target_material'.
+    Ya no iteramos objetos, modificamos directamente el material compartido.
+    """
+    target_img = self.target_image
+    mat = self.target_material # Usamos el material global seleccionado
+    
+    if not target_img or not mat: return
+    
+    # --- Configuración de Nodos del Material ---
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    
+    # 1. Buscar o Crear Principled BSDF
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not bsdf:
+        nodes.clear() # Limpiamos si estaba sucio
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.location = (0, 0)
+        out = nodes.new('ShaderNodeOutputMaterial')
+        out.location = (300, 0)
+        links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    
+    # 2. Buscar o Crear Nodo de Imagen
+    tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
+    if not tex_node:
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.location = (-300, 200)
+    
+    # 3. Asignar Imagen y Configurar
+    tex_node.image = target_img
+    tex_node.interpolation = 'Closest' # Pixel Art style
+    
+    # 4. Conectar
+    if 'Base Color' in bsdf.inputs:
+        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+    if 'Alpha' in bsdf.inputs:
+        links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+        
+    # 5. Configurar Transparencia
+    mat.blend_method = 'CLIP'
+    mat.shadow_method = 'CLIP'
 
 # --- UI Y PANEL ---
 
@@ -68,6 +71,14 @@ class HytaleProperties(bpy.types.PropertyGroup):
         name="Colección",
         type=bpy.types.Collection,
         description="Selecciona la colección del modelo"
+    )
+    
+    # --- NUEVO: Propiedad para el Material ---
+    target_material: bpy.props.PointerProperty(
+        name="Material Base",
+        type=bpy.types.Material,
+        description="Este material se aplicará a todo el modelo",
+        update=update_target_material
     )
     
     # --- SISTEMA DE SELECCIÓN DE TEXTURA ---
@@ -161,45 +172,55 @@ class PT_HytalePanel(bpy.types.Panel):
         
         layout.separator()
         
-        # --- EXPORTACIÓN Y TEXTURAS (Aquí está el cambio) ---
+        # --- EXPORTACIÓN Y TEXTURAS ---
         box = layout.box()
-        box.label(text="Exportación:", icon='EXPORT')
+        box.label(text="Configuración de Exportación:", icon='EXPORT')
         col = box.column(align=True)
+        
+        # 1. Elegir Colección
         col.prop(props, "target_collection", icon='OUTLINER_COLLECTION')
         
-        col.separator()
-        col.label(text="Definición de UVs:", icon='TEXTURE')
-        
-        # Selector de Modo (Botones)
-        col.prop(props, "resolution_mode", expand=True)
-        
-        if props.resolution_mode == 'IMAGE':
-            # Interfaz Modo Imagen
-            box_inner = col.box()
-            box_inner.label(text="Selecciona la Skin:", icon='IMAGE_DATA')
-            box_inner.template_ID(props, "target_image", open="image.open")
+        # 2. Elegir Material (Solo si hay colección)
+        if props.target_collection:
+            col.separator()
+            col.label(text="Material Unificado:", icon='MATERIAL')
+            col.prop(props, "target_material", text="")
             
-            if props.target_image:
-                row = box_inner.row()
-                row.alignment = 'CENTER'
-                row.label(text=f"Detectado: {props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
+        # 3. Elegir Textura (Solo si hay Material)
+        if props.target_collection and props.target_material:
+            col.separator()
+            col.label(text="Configuración de Textura:", icon='TEXTURE')
+            
+            row = col.row(align=True)
+            row.prop(props, "resolution_mode", expand=True)
+            
+            if props.resolution_mode == 'IMAGE':
+                # Interfaz Modo Imagen
+                box_inner = col.box()
+                box_inner.label(text="Selecciona la Skin:", icon='IMAGE_DATA')
+                box_inner.template_ID(props, "target_image", open="image.open")
+                
+                if props.target_image:
+                    row = box_inner.row()
+                    row.alignment = 'CENTER'
+                    row.label(text=f"Detectado: {props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
+                else:
+                    box_inner.label(text="¡Selecciona una imagen!", icon='INFO')
             else:
-                box_inner.label(text="¡Selecciona una imagen!", icon='ERROR')
-        else:
-            # Interfaz Modo Manual
-            box_inner = col.box()
-            box_inner.label(text="Lienzo Manual:", icon='EDITMODE_HLT')
-            row = box_inner.row(align=True)
-            row.prop(props, "tex_width")
-            row.prop(props, "tex_height")
+                # Interfaz Modo Manual
+                box_inner = col.box()
+                box_inner.label(text="Lienzo Manual:", icon='EDITMODE_HLT')
+                row = box_inner.row(align=True)
+                row.prop(props, "tex_width")
+                row.prop(props, "tex_height")
 
-        col.separator()
-        col.prop(props, "snap_uvs")
-        col.prop(props, "file_path", text="")
-        
-        row = col.row()
-        row.scale_y = 1.5
-        row.operator("hytale.export_model", icon='CHECKMARK', text="EXPORTAR")
+            col.separator()
+            col.prop(props, "snap_uvs")
+            col.prop(props, "file_path", text="")
+            
+            row = col.row()
+            row.scale_y = 1.5
+            row.operator("hytale.export_model", icon='CHECKMARK', text="EXPORTAR")
 
 classes = (HytaleProperties, OPS_OT_SetupHytaleScene, OPS_OT_LoadReference, OPS_OT_ExportHytale, OPS_OT_ImportHytale, PT_HytalePanel, OPS_OT_PixelPerfectPack)
 
