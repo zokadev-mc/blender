@@ -416,6 +416,11 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     for child in obj.children:
         node_data["children"].append(process_node(child, out_w, out_h, snap_uvs, id_counter))
 
+    # --- NUEVO: SI NO TIENE HIJOS, BORRAMOS LA CLAVE ---
+    if not node_data["children"]:
+        del node_data["children"]
+    # ---------------------------------------------------
+
     return node_data
 
 # ==========================================
