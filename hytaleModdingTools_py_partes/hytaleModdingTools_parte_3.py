@@ -7,11 +7,11 @@ def update_target_texture(self, context):
     esta función la aplica automáticamente al material de los objetos.
     """
     target_img = self.target_image
-    col_name = self.collection_name
+    collection = self.target_collection
     
     # Validaciones básicas
     if not target_img: return
-    if col_name not in bpy.data.collections: return
+    if not collection: return # Si no hay colección seleccionada, no hacemos nada
         
     collection = bpy.data.collections[col_name]
     
@@ -19,7 +19,7 @@ def update_target_texture(self, context):
         if obj.type == 'MESH':
             # 1. Obtener o crear material
             if not obj.data.materials:
-                mat = bpy.data.materials.new(name=f"Hytale_{col_name}_Mat")
+                mat = bpy.data.materials.new(name=f"Hytale_{collection.name}_Mat")
                 obj.data.materials.append(mat)
             else:
                 mat = obj.data.materials[0]
