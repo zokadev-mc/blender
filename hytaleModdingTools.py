@@ -1,9 +1,7 @@
 # fixed version of HytaleModelExporterPre.py
 # Changes:
-# - v24.29: "Safety Check" Popup on Export.
+# - v0.33: "Safety Check" Popup on Export.
 #   If the validator detects ANY issues (warnings or errors), a confirmation popup appears asking to proceed or cancel.
-# - v24.28: UI Icon Update (Alert icon).
-# - v24.26: STRICT "Unparent" logic.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
@@ -11,7 +9,7 @@ bl_info = {
     "version": (0, 33),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.1 (Aviso de seguridad antes de exportar si hay errores).",
+    "description": "Exportador v0.33 (Aviso de seguridad antes de exportar si hay errores).",
     "category": "Import-Export",
 }
 
