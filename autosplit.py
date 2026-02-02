@@ -20,11 +20,10 @@ def is_safe_break_point(line, extension):
     
     # Lógica HTML: Romper DESPUÉS de cerrar un bloque importante
     elif extension in ['html', 'xml', 'htm']:
-        # Busca etiquetas de cierre estructurales
         if stripped.endswith('</div>') or stripped.endswith('</section>') or \
            stripped.endswith('</body>') or stripped.endswith('</script>') or \
            stripped.endswith('</style>'):
-            return 'AFTER' # Indica cortar después de esta línea (incluyéndola en el bloque anterior)
+            return 'AFTER' # Indica cortar después de esta línea
 
     # Lógica C-STYLE (JS, CSS, Java, etc): Romper DESPUÉS de cerrar llave
     elif extension in ['js', 'css', 'java', 'json', 'lua']:
@@ -38,13 +37,10 @@ def get_changed_files():
     Pregunta a GIT qué archivos cambiaron entre el commit anterior y el actual.
     """
     try:
-        # Ejecuta: git diff --name-only HEAD~1 HEAD
-        # Esto devuelve la lista de archivos modificados en el último push
         cmd = ["git", "diff", "--name-only", "HEAD~1", "HEAD"]
         output = subprocess.check_output(cmd, text=True)
         files = output.splitlines()
         
-        # Filtramos para asegurarnos que existen (por si borraste uno) y tienen extensión correcta
         valid_files = []
         for f in files:
             if os.path.exists(f):
@@ -54,11 +50,9 @@ def get_changed_files():
         return valid_files
     except Exception as e:
         print(f"Error obteniendo cambios de git: {e}")
-        # Si falla (ej. primer commit), devolvemos lista vacía o podrías usar os.walk como fallback
         return []
 
 def split_file(file_path):
-    # Lógica de división idéntica a la anterior...
     file_name = os.path.basename(file_path)
     print(f"Detectado cambio en: {file_name} -> Procesando...")
     
@@ -91,15 +85,11 @@ def split_file(file_path):
         if len(current_chunk) >= MIN_LINES_PER_PART:
             
             if break_type == 'BEFORE':
-                # Caso Python: La línea actual inicia algo nuevo (ej: def funcion)
-                # Guardamos lo que llevamos y empezamos el nuevo chunk con esta línea
                 parts.append(current_chunk)
                 current_chunk = [line]
                 continue
                 
             elif break_type == 'AFTER':
-                # Caso HTML/JS: La línea actual cierra algo (ej: </div> o })
-                # Añadimos esta línea al chunk actual para cerrarlo bien, y luego cortamos
                 current_chunk.append(line)
                 parts.append(current_chunk)
                 current_chunk = []
@@ -115,15 +105,16 @@ def split_file(file_path):
         part_filename = f"{base_name}_parte_{i+1}.{extension}"
         part_path = os.path.join(output_dir, part_filename)
         
-        # MEJORA DE HEADER: Comentarios correctos según lenguaje
+        # Generar cabecera según el lenguaje
         header_text = f"// PARTE {i+1}/{total_parts} - {file_name}\n// CAMBIOS RECIENTES\n\n"
         
         if extension == 'py': 
             header_text = header_text.replace('//', '#')
         elif extension in ['html', 'xml', 'htm']: 
-            # HTML usa comentarios header_text = f"\n\n\n"
+            header_text = f"\n\n\n"
         elif extension == 'lua':
             header_text = header_text.replace('//', '--')
+
         with open(part_path, 'w', encoding='utf-8') as p:
             p.write(header_text)
             p.writelines(chunk)
