@@ -8,10 +8,29 @@ MIN_LINES_PER_PART = 500
 IGNORE_DIRS = ['.git', '.github', '__pycache__', 'node_modules']
 
 def is_safe_break_point(line, extension):
-    if not line.strip(): return False
-    if not line.startswith(' ') and not line.startswith('\t'):
-        if line.startswith('@') or line.startswith('#') or line.startswith('//'): return False
-        return True
+    stripped = line.strip()
+    if not stripped: return False
+
+    # Lógica PYTHON: Romper ANTES de definir una nueva función/clase
+    if extension == 'py':
+        if not line.startswith(' ') and not line.startswith('\t'):
+            if line.startswith('@') or line.startswith('#') or line.startswith('//'): 
+                return False
+            return 'BEFORE' # Indica cortar antes de esta línea
+    
+    # Lógica HTML: Romper DESPUÉS de cerrar un bloque importante
+    elif extension in ['html', 'xml', 'htm']:
+        # Busca etiquetas de cierre estructurales
+        if stripped.endswith('</div>') or stripped.endswith('</section>') or \
+           stripped.endswith('</body>') or stripped.endswith('</script>') or \
+           stripped.endswith('</style>'):
+            return 'AFTER' # Indica cortar después de esta línea (incluyéndola en el bloque anterior)
+
+    # Lógica C-STYLE (JS, CSS, Java, etc): Romper DESPUÉS de cerrar llave
+    elif extension in ['js', 'css', 'java', 'json', 'lua']:
+        if stripped.endswith('}'):
+            return 'AFTER'
+            
     return False
 
 def get_changed_files():
@@ -66,12 +85,27 @@ def split_file(file_path):
     current_chunk = []
     
     for line in lines:
-        current_chunk.append(line)
+        break_type = is_safe_break_point(line, extension)
+        
+        # Solo intentamos cortar si ya superamos el mínimo de líneas
         if len(current_chunk) >= MIN_LINES_PER_PART:
-            if is_safe_break_point(line, extension):
-                last_line = current_chunk.pop() 
+            
+            if break_type == 'BEFORE':
+                # Caso Python: La línea actual inicia algo nuevo (ej: def funcion)
+                # Guardamos lo que llevamos y empezamos el nuevo chunk con esta línea
                 parts.append(current_chunk)
-                current_chunk = [last_line]
+                current_chunk = [line]
+                continue
+                
+            elif break_type == 'AFTER':
+                # Caso HTML/JS: La línea actual cierra algo (ej: </div> o })
+                # Añadimos esta línea al chunk actual para cerrarlo bien, y luego cortamos
+                current_chunk.append(line)
+                parts.append(current_chunk)
+                current_chunk = []
+                continue
+
+        current_chunk.append(line)
 
     if current_chunk:
         parts.append(current_chunk)
@@ -81,9 +115,15 @@ def split_file(file_path):
         part_filename = f"{base_name}_parte_{i+1}.{extension}"
         part_path = os.path.join(output_dir, part_filename)
         
+        # MEJORA DE HEADER: Comentarios correctos según lenguaje
         header_text = f"// PARTE {i+1}/{total_parts} - {file_name}\n// CAMBIOS RECIENTES\n\n"
-        if extension == 'py': header_text = header_text.replace('//', '#')
-        elif extension in ['html', 'xml']: header_text = f"\n"
+        
+        if extension == 'py': 
+            header_text = header_text.replace('//', '#')
+        elif extension in ['html', 'xml', 'htm']: 
+            # HTML usa comentarios header_text = f"\n\n\n"
+        elif extension == 'lua':
+            header_text = header_text.replace('//', '--')
 
         with open(part_path, 'w', encoding='utf-8') as p:
             p.write(header_text)
