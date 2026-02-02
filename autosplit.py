@@ -9,25 +9,35 @@ IGNORE_DIRS = ['.git', '.github', '__pycache__', 'node_modules']
 
 def is_safe_break_point(line, extension):
     stripped = line.strip()
-    if not stripped: return False
 
-    # Lógica PYTHON: Romper ANTES de definir una nueva función/clase
+    # MEJORA 1: Las líneas vacías suelen ser los mejores puntos de corte.
+    # Antes esto devolvía False, impidiendo cortar si no encontraba una etiqueta específica.
+    if not stripped:
+        return 'BEFORE'
+
+    # Lógica PYTHON
     if extension == 'py':
         if not line.startswith(' ') and not line.startswith('\t'):
             if line.startswith('@') or line.startswith('#') or line.startswith('//'): 
                 return False
-            return 'BEFORE' # Indica cortar antes de esta línea
+            return 'BEFORE'
     
-    # Lógica HTML: Romper DESPUÉS de cerrar un bloque importante
+    # Lógica HTML MEJORADA (Híbrida)
     elif extension in ['html', 'xml', 'htm']:
+        # 1. Cierres estructurales de HTML
         if stripped.endswith('</div>') or stripped.endswith('</section>') or \
            stripped.endswith('</body>') or stripped.endswith('</script>') or \
-           stripped.endswith('</style>'):
-            return 'AFTER' # Indica cortar después de esta línea
+           stripped.endswith('</style>') or stripped.endswith('-->'):
+            return 'AFTER'
+        
+        # 2. Cierres de JS/CSS dentro del HTML (para tus scripts incrustados)
+        # Si la línea termina en llave o punto y coma, es seguro cortar después.
+        if stripped.endswith('}') or stripped.endswith('];') or stripped.endswith(');'):
+            return 'AFTER'
 
-    # Lógica C-STYLE (JS, CSS, Java, etc): Romper DESPUÉS de cerrar llave
+    # Lógica JS/CSS/Java/etc
     elif extension in ['js', 'css', 'java', 'json', 'lua']:
-        if stripped.endswith('}'):
+        if stripped.endswith('}') or stripped.endswith('];') or stripped.endswith(');'):
             return 'AFTER'
             
     return False
