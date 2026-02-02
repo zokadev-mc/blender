@@ -124,7 +124,6 @@ def split_file(file_path):
             # HTML usa comentarios header_text = f"\n\n\n"
         elif extension == 'lua':
             header_text = header_text.replace('//', '--')
-
         with open(part_path, 'w', encoding='utf-8') as p:
             p.write(header_text)
             p.writelines(chunk)
