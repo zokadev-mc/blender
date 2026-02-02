@@ -1,6 +1,168 @@
 
 
 
+						handle.userData.virtId = v.id; 
+						this.handles.push(handle);
+						this.scene.add(handle);
+						v.handle = handle; 
+					});
+								
+					this.setupDirectWireframe(mesh);
+					// Render extra para asegurar que se vean
+					if(this.renderer && this.scene && this.camera) {
+						this.renderer.render(this.scene, this.camera);
+					}
+				});
+
+				document.getElementById('status').innerText = "Modo Edición: Activo";
+				
+				// UI
+				document.getElementById('sub-mode-bar').classList.remove('hidden');
+				document.getElementById('edit-tools-bar').classList.remove('hidden');
+				document.getElementById('transform-tools').classList.add('hidden');
+			}
+
+            cacheGridIndices(mesh) {
+                const segs = mesh.userData.segments;
+                const nx = segs.x + 1;
+                const ny = segs.y + 1;
+                const nz = segs.z + 1;
+
+                mesh.geometry.computeBoundingBox();
+                const min = mesh.geometry.boundingBox.min;
+                const max = mesh.geometry.boundingBox.max;
+                const size = new THREE.Vector3().subVectors(max, min);
+
+                if(size.x === 0) size.x = 1;
+                if(size.y === 0) size.y = 1;
+                if(size.z === 0) size.z = 1;
+
+                if(!mesh.userData.gridInfo) mesh.userData.gridInfo = [];
+
+                this.handles.forEach((h, hIdx) => {
+                    const localPos = h.position.clone();
+                    mesh.worldToLocal(localPos);
+
+                    const percentX = (localPos.x - min.x) / size.x;
+                    const percentY = (localPos.y - min.y) / size.y;
+                    const percentZ = (localPos.z - min.z) / size.z;
+
+                    const ix = Math.max(0, Math.min(nx - 1, Math.round(percentX * segs.x)));
+                    const iy = Math.max(0, Math.min(ny - 1, Math.round(percentY * segs.y)));
+                    const iz = Math.max(0, Math.min(nz - 1, Math.round(percentZ * segs.z)));
+
+                    const vIdx = this.vertexMap.indexOf(hIdx);
+                    if (vIdx !== -1) {
+                         mesh.userData.gridInfo[vIdx] = { x: ix, y: iy, z: iz };
+                    }
+                });
+            }
+			
+			generateSpatialGrid(mesh) {
+                const segs = mesh.userData.segments;
+                const nx = segs.x + 1;
+                const ny = segs.y + 1;
+                const nz = segs.z + 1;
+
+                const items = this.handles.map(h => {
+                    const localPos = h.position.clone();
+                    mesh.worldToLocal(localPos);
+                    return { h, x: localPos.x, y: localPos.y, z: localPos.z };
+                });
+
+                const EPSILON = 0.001; 
+
+                const gapSort = (arr, prop) => {
+                    arr.sort((a,b) => a[prop] - b[prop]); 
+                    const buckets = [];
+                    if (arr.length === 0) return buckets;
+                    let currentBucket = [arr[0]];
+                    buckets.push(currentBucket);
+                    for (let i = 1; i < arr.length; i++) {
+                        if (Math.abs(arr[i][prop] - arr[i-1][prop]) > EPSILON) {
+                            currentBucket = [arr[i]];
+                            buckets.push(currentBucket);
+                        } else {
+                            currentBucket.push(arr[i]);
+                        }
+                    }
+                    return buckets;
+                };
+
+                const grid = [];
+                const xBuckets = gapSort(items, 'x');
+                
+                if(xBuckets.length > nx) {
+                     xBuckets.sort((a,b) => b.length - a.length);
+                     const selected = xBuckets.slice(0, nx).sort((a,b) => a[0].x - b[0].x);
+                     xBuckets.length = 0; xBuckets.push(...selected);
+                }
+                
+                for(let i=0; i<nx; i++) {
+                    grid[i] = [];
+                    const xItems = xBuckets[i] || xBuckets[xBuckets.length-1]; 
+                    
+                    const yBuckets = gapSort(xItems, 'y');
+                    
+                    if(yBuckets.length > ny) {
+                         yBuckets.sort((a,b) => b.length - a.length);
+                         const selected = yBuckets.slice(0, ny).sort((a,b) => a[0].y - b[0].y);
+                         yBuckets.length = 0; yBuckets.push(...selected);
+                    }
+
+                    for(let j=0; j<ny; j++) {
+                        const yItems = yBuckets[j] || yBuckets[yBuckets.length-1]; 
+                        
+                        yItems.sort((a,b) => a.z - b.z);
+
+                        grid[i][j] = [];
+                        for(let k=0; k<nz; k++) {
+                            const item = yItems[k] || yItems[yItems.length-1]; 
+                            grid[i][j][k] = item.h;
+                        }
+                    }
+                }
+                return grid;
+            }
+
+            getStructuredHandles(mesh) {
+                if (mesh.userData.gridInfo && this.vertexMap.length > 0) {
+                    const segs = mesh.userData.segments;
+                    const nx = segs.x + 1, ny = segs.y + 1, nz = segs.z + 1;
+                    
+                    const grid = Array(nx).fill().map(() => Array(ny).fill().map(() => Array(nz).fill(null)));
+                    
+                    let dataCount = 0;
+                    
+                    this.handles.forEach((h, hIdx) => {
+                        const vIdx = this.vertexMap.indexOf(hIdx);
+                        if(vIdx !== -1 && mesh.userData.gridInfo[vIdx]) {
+                            const {x, y, z} = mesh.userData.gridInfo[vIdx];
+                            if(x < nx && y < ny && z < nz) {
+                                grid[x][y][z] = h;
+                                dataCount++;
+                            }
+                        }
+                    });
+
+                    if (dataCount > 0) return grid;
+                }
+                
+                this.cacheGridIndices(mesh);
+                return this.getStructuredHandles(mesh);
+            }
+			
+            exitEditMode() {
+                this.state.mode = 'object'; this.state.editTool = 'select'; 
+                this.resetKnifeTool(); this.orbit.enabled = true;
+                this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333));
+                this.state.multiSelection = [];
+                this.connectionLine.visible = false;
+                document.getElementById('action-container').classList.add('hidden');
+                
+                document.getElementById('tool-select').click();
+                this.clearHandles(); 
+                if(this.wireframeHelper) { this.state.selectedObj.remove(this.wireframeHelper); this.wireframeHelper = null; }
                 
                 this.state.userEdges = []; 
 
@@ -42,45 +204,78 @@
 			
 				if (this.state.editTool === 'select') {
 					
-					// SUB-MODO: VÉRTICES
+					// SUB-MODO: VÉRTICES (REEMPLAZAR ESTE BLOQUE)
 					if (this.state.selectMode === 'vertex') {
 						const targets = [...this.handles];
-						// Nota: NO agregamos selectedObj a targets para evitar falsos positivos
+				
+						// 1. PASO DE OCLUSIÓN: ¿Qué tan lejos está la pared visible?
+						const meshHits = this.raycaster.intersectObject(this.state.selectedObj);
+						let visibleDistanceLimit = Infinity;
 						
-						// Intersectamos SOLO los handles visibles
+						// Si golpeamos el objeto, definimos el límite de visión.
+						// Le damos +0.15 de margen porque los handles (esferas) sobresalen un poco de la superficie.
+						if (meshHits.length > 0) {
+							visibleDistanceLimit = meshHits[0].distance + 0.15;
+						}
+				
+						// 2. Intersectamos todos los handles
 						const hits = this.raycaster.intersectObjects(targets, true);
 						
-						// Filtro estricto: ¿Es realmente un handle?
-						const validHit = hits.find(h => {
+						// 3. FILTRO MAESTRO: Ignorar handles que están detrás de la pared
+						// Solo aceptamos hits cuya distancia sea menor al límite visible
+						const visibleHits = hits.filter(h => h.distance < visibleDistanceLimit);
+				
+						// 4. Validar que sea un handle real
+						const validHit = visibleHits.find(h => {
 							return this.handles.includes(h.object) || (h.object.parent && this.handles.includes(h.object.parent));
 						});
-
+				
 						if (validHit) {
 							const handle = this.handles.includes(validHit.object) ? validHit.object : validHit.object.parent;
 							this.setSelection([handle], "Vértice Seleccionado");
 						} 
-						// Si no hay hit válido, el gizmo ya está detach() por defecto arriba.
+						// Si no hay hit válido visible, el gizmo se queda apagado (detach).
 					} 
 					
-					// SUB-MODO: BORDES
+					// REEMPLAZAR BLOQUE 'edge'
 					else if (this.state.selectMode === 'edge') {
-						const closestEdge = this.findClosestVisibleEdge(this.raycaster);
-						if (closestEdge) {
-							const [h1, h2] = closestEdge;
-							this.setSelection([h1, h2], "Borde Seleccionado");
-							this.edgeHighlightHelper.geometry.setFromPoints([h1.position, h2.position]);
-							this.edgeHighlightHelper.visible = true;
+						const edgeData = this.findClosestEdge(this.raycaster);
+						if (edgeData) {
+							// Ahora edgeData tiene .ids (IDs virtuales) y .points (Vector3)
+							// Necesitamos encontrar los handles visuales para seleccionarlos
+							const h1 = this.virtualMesh.verts[edgeData.ids[0]].handle;
+							const h2 = this.virtualMesh.verts[edgeData.ids[1]].handle;
+							
+							if(h1 && h2) {
+								this.setSelection([h1, h2], "Borde Seleccionado");
+								this.edgeHighlightHelper.geometry.setFromPoints(edgeData.points);
+								this.edgeHighlightHelper.visible = true;
+							}
 						}
 					}
 			
-					// SUB-MODO: CARAS
+					// REEMPLAZAR BLOQUE 'face'
 					else if (this.state.selectMode === 'face') {
-						const face = this.findClosestFace(this.raycaster);
-						if (face) {
-							this.setSelection(face, "Cara Seleccionada");
-							const p = face.map(h => h.position);
-							const pos = [p[0].x, p[0].y, p[0].z, p[1].x, p[1].y, p[1].z, p[3].x, p[3].y, p[3].z,  p[1].x, p[1].y, p[1].z, p[2].x, p[2].y, p[2].z, p[3].x, p[3].y, p[3].z];
-							this.faceHighlightHelper.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+						// findClosestFace ahora devuelve un array de handles directamente y guarda this.state.selectedFaceId
+						const faceHandles = this.findClosestFace(this.raycaster);
+						if (faceHandles) {
+							this.setSelection(faceHandles, "Cara Seleccionada");
+							
+							// Dibujar el highlight (cuadrado rojo/naranja)
+							// Triangulamos visualmente para el helper (Fan triangulation)
+							const pts = [];
+							const center = new THREE.Vector3();
+							faceHandles.forEach(h => center.add(h.position));
+							center.divideScalar(faceHandles.length);
+					
+							// Crear triángulos visuales para el highlight
+							for(let i=0; i<faceHandles.length; i++) {
+								pts.push(faceHandles[i].position.x, faceHandles[i].position.y, faceHandles[i].position.z);
+								pts.push(faceHandles[(i+1)%faceHandles.length].position.x, faceHandles[(i+1)%faceHandles.length].position.y, faceHandles[(i+1)%faceHandles.length].position.z);
+								pts.push(center.x, center.y, center.z);
+							}
+					
+							this.faceHighlightHelper.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
 							this.faceHighlightHelper.visible = true;
 						}
 					}
@@ -89,174 +284,119 @@
 			}	
 	
 					updateGeometryFromHandles() { 
-					const mesh = this.state.selectedObj; 
-					if (!mesh || !mesh.geometry) return; 
+						if (!this.state.selectedObj || !this.virtualMesh) return; 
 					
-					const posAttr = mesh.geometry.attributes.position; 
+						// 1. Calcular la matriz inversa (Mundo -> Local)
+						const inverseMatrix = this.state.selectedObj.matrixWorld.clone().invert();
 					
-					// 1. Actualizar la forma del cubo (física)
-					for(let i=0; i < this.vertexMap.length; i++) { 
-						const handleIdx = this.vertexMap[i]; 
-						if(handleIdx !== undefined && handleIdx !== -1 && handleIdx < this.handles.length) { 
-							const handle = this.handles[handleIdx]; 
-							const worldPos = handle.position.clone(); 
-							mesh.worldToLocal(worldPos); 
-							posAttr.setXYZ(i, worldPos.x, worldPos.y, worldPos.z); 
-						} 
-					} 
-					posAttr.needsUpdate = true; 
-					mesh.geometry.computeVertexNormals(); 
-				
-					// 2. Actualizar el Wireframe Rojo (la malla general)
-					if (this.state.mode === 'edit') {
-						this.setupDirectWireframe(mesh);
-					}
+						// 2. SINCRONIZAR: De Handles (Mundo) -> VirtualMesh (Local)
+						Object.values(this.virtualMesh.verts).forEach(v => {
+							if(v.handle) {
+								// Tomamos la posición visual actual (Mundo)
+								const worldPos = v.handle.position.clone();
+								
+								// La convertimos a local relativo al objeto
+								const localPos = worldPos.applyMatrix4(inverseMatrix);
 					
-					// 3. Actualizar visualmente la selección (Verde/Amarillo) en tiempo real
+								// Guardamos el dato local
+								v.x = localPos.x;
+								v.y = localPos.y;
+								v.z = localPos.z;
+							}
+						});
 					
-					// CASO BORDES: Si estamos moviendo un borde, redibujar la línea
-					if(this.state.selectMode === 'edge' && this.state.selectedGroup.length === 2) {
-						const pts = this.state.selectedGroup.map(h => h.position);
-						this.edgeHighlightHelper.geometry.setFromPoints(pts);
-					}
-				
-					// CASO CARAS: Si estamos moviendo una cara, redibujar el cuadrado rojo
-					if(this.state.selectMode === 'face' && this.state.selectedGroup.length === 4) {
-						const h = this.state.selectedGroup;
-						const pos = [
-							h[0].position, h[1].position, h[3].position, 
-							h[1].position, h[2].position, h[3].position  
-						].flatMap(p => [p.x, p.y, p.z]);
-				
-						this.faceHighlightHelper.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-					}
-				}         
+						// 3. REGENERAR GEOMETRÍA (Esto usa los datos locales, así que ya está bien)
+						const newGeo = this.virtualMesh.toBufferGeometry();
+						
+						this.state.selectedObj.geometry.dispose();
+						this.state.selectedObj.geometry = newGeo;
+						
+						if (this.state.mode === 'edit') {
+							this.setupDirectWireframe(this.state.selectedObj);
+						}
+						
+						// === NUEVO: GUARDAR EN LA MOCHILA DEL OBJETO ===
+						// Esto asegura que si sales y vuelves, la data esté ahí.
+						this.state.selectedObj.userData.vmData = this.virtualMesh.toJSON();
+					}         
 		 
             createHandleMesh(pos) { const hitGeo = new THREE.SphereGeometry(0.15, 8, 8); const hitMat = new THREE.MeshBasicMaterial({ color: 0xff0000, visible: false }); const hitMesh = new THREE.Mesh(hitGeo, hitMat); hitMesh.position.copy(pos); const visualGeo = new THREE.SphereGeometry(0.06, 8, 8); const visualMat = new THREE.MeshBasicMaterial({ color: 0xff3333, depthTest:true, transparent:false }); const visualMesh = new THREE.Mesh(visualGeo, visualMat); hitMesh.add(visualMesh); return hitMesh; }
             
-            getFullEdgeLine(edge) {
-                if(!this.state.selectedObj || !edge) return [];
-                
-                const grid = this.getStructuredHandles(this.state.selectedObj);
-                if (!grid || !grid.length) return [];
-                
-                const nx = grid.length;
-                const ny = grid[0]?.length || 0;
-                const nz = grid[0]?.[0]?.length || 0;
-
-                const { axis, x, y, z } = edge;
-                const points = [];
-
-                const getPos = (i, j, k) => grid[i]?.[j]?.[k]?.position;
-
-                if (axis === 'x' || axis === 'z') {
-                    const j = y; 
-                    
-                    for(let i=0; i < nx - 1; i++) {
-                        const p1 = getPos(i, j, nz-1);
-                        const p2 = getPos(i+1, j, nz-1);
-                        if(p1 && p2) points.push(p1, p2);
-
-                        const p3 = getPos(i, j, 0);
-                        const p4 = getPos(i+1, j, 0);
-                        if(p3 && p4) points.push(p3, p4);
-                    }
-
-                    for(let k=0; k < nz - 1; k++) {
-                        const p1 = getPos(0, j, k);
-                        const p2 = getPos(0, j, k+1);
-                        if(p1 && p2) points.push(p1, p2);
-
-                        const p3 = getPos(nx-1, j, k);
-                        const p4 = getPos(nx-1, j, k+1);
-                        if(p3 && p4) points.push(p3, p4);
-                    }
-                }
-                
-                else if (axis === 'y') {
-                    if (z === 0 || z === nz - 1) {
-                        const i = x; 
-                        
-                        for(let j=0; j < ny - 1; j++) {
-                            const p1 = getPos(i, j, 0);     
-                            const p2 = getPos(i, j+1, 0);
-                            if(p1 && p2) points.push(p1, p2);
-
-                            const p3 = getPos(i, j, nz-1);  
-                            const p4 = getPos(i, j+1, nz-1);
-                            if(p3 && p4) points.push(p3, p4);
-                        }
-                        
-                        for(let k=0; k < nz - 1; k++) {
-                            const p1 = getPos(i, 0, k);     
-                            const p2 = getPos(i, 0, k+1);
-                            if(p1 && p2) points.push(p1, p2);
-
-                            const p3 = getPos(i, ny-1, k);  
-                            const p4 = getPos(i, ny-1, k+1);
-                            if(p3 && p4) points.push(p3, p4);
-                        }
-                    }
-                    else {
-                        const k = z; 
-                        
-                        for(let j=0; j < ny - 1; j++) {
-                            const p1 = getPos(0, j, k);     
-                            const p2 = getPos(0, j+1, k);
-                            if(p1 && p2) points.push(p1, p2);
-
-                            const p3 = getPos(nx-1, j, k);  
-                            const p4 = getPos(nx-1, j+1, k);
-                            if(p3 && p4) points.push(p3, p4);
-                        }
-
-                        for(let i=0; i < nx - 1; i++) {
-                            const p1 = getPos(i, 0, k);     
-                            const p2 = getPos(i+1, 0, k);
-                            if(p1 && p2) points.push(p1, p2);
-
-                            const p3 = getPos(i, ny-1, k);  
-                            const p4 = getPos(i+1, ny-1, k);
-                            if(p3 && p4) points.push(p3, p4);
-                        }
-                    }
-                }
-                
-                return points; 
-            }
-            
-		findClosestEdge(raycaster) { 
-			const mesh = this.state.selectedObj; 
-			if(!mesh) return null;
-		
-			const grid = this.getStructuredHandles(mesh); 
-			if(!grid) return null; 
-		
-			const segs = mesh.userData.segments; 
-			let bestEdge = null, minDst = Infinity; 
-			
-			const ray = raycaster.ray; 
-			const ptOnRay = new THREE.Vector3();
-			const ptOnSeg = new THREE.Vector3(); 
-		
-			const checkEdge = (h1, h2, axis, x, y, z) => { 
-				if (!h1 || !h2) return;
-		
-				const dstSq = ray.distanceSqToSegment(h1.position, h2.position, ptOnRay, ptOnSeg); 
-				
-				if(dstSq < minDst) { 
-					minDst = dstSq; 
-					bestEdge = { h1, h2, axis, x, y, z }; 
-				} 
-			}; 
-		
-			if (grid.length > 0) {
-				for(let i=0; i < segs.x; i++) for(let j=0; j <= segs.y; j++) for(let k=0; k <= segs.z; k++) if(grid[i] && grid[i+1] && grid[i][j] && grid[i+1][j]) checkEdge(grid[i][j][k], grid[i+1][j][k], 'x', i, j, k); 
-				for(let i=0; i <= segs.x; i++) for(let j=0; j < segs.y; j++) for(let k=0; k <= segs.z; k++) if(grid[i] && grid[i][j] && grid[i][j+1]) checkEdge(grid[i][j][k], grid[i][j+1][k], 'y', i, j, k); 
-				for(let i=0; i <= segs.x; i++) for(let j=0; j <= segs.y; j++) for(let k=0; k < segs.z; k++) if(grid[i] && grid[i][j] && grid[i][j][k] && grid[i][j][k+1]) checkEdge(grid[i][j][k], grid[i][j][k+1], 'z', i, j, k); 
+            getFullEdgeLine(edgeData) {
+				// La nueva findClosestEdge devuelve { points: [Vector3, Vector3] }
+				if (edgeData && edgeData.points) {
+					return edgeData.points;
+				}
+				return [];
 			}
+            
+		findClosestEdge(raycaster) {
+			if (!this.virtualMesh || !this.state.selectedObj) return null;
 		
-			return (Math.sqrt(minDst) < 0.5) ? bestEdge : null; 
+			// 1. PASO CRÍTICO: Calcular la barrera visual (Oclusión)
+			// Lanzamos el rayo contra la malla sólida para ver qué está al frente.
+			const meshHits = raycaster.intersectObject(this.state.selectedObj);
+			
+			// Si no golpeamos el objeto visualmente, no deberíamos poder seleccionar bordes
+			// (A menos que quieras seleccionar bordes en el aire, pero para robustez es mejor esto)
+			if (meshHits.length === 0) return null;
+		
+			// Esta es la distancia máxima permitida. Cualquier cosa detrás de esto está oculta.
+			// Le damos un pequeño margen (+0.1 o +0.2) para que los bordes superficiales sean detectables.
+			const visibleDistanceLimit = meshHits[0].distance + 0.2;
+		
+			let bestEdge = null;
+			let minDiff = Infinity; // Diferencia entre el rayo y el borde
+			
+			// Umbral de precisión del mouse (qué tan cerca debo hacer clic)
+			const threshold = 0.3; 
+			const matrix = this.state.selectedObj.matrixWorld;
+			
+			// Variables temporales para evitar basura en memoria
+			const ptOnRay = new THREE.Vector3();
+			const ptOnSeg = new THREE.Vector3();
+			const ray = raycaster.ray;
+		
+			Object.values(this.virtualMesh.faces).forEach(face => {
+				const verts = face.verts;
+				for (let i = 0; i < verts.length; i++) {
+					const id1 = verts[i];
+					const id2 = verts[(i + 1) % verts.length];
+		
+					// Evitar duplicados (procesar 1-2 y 2-1)
+					if (id1 > id2) continue; 
+					
+					const v1 = this.virtualMesh.verts[id1];
+					const v2 = this.virtualMesh.verts[id2];
+					
+					// Transformar a coordenadas MUNDIALES
+					const p1World = new THREE.Vector3(v1.x, v1.y, v1.z).applyMatrix4(matrix);
+					const p2World = new THREE.Vector3(v2.x, v2.y, v2.z).applyMatrix4(matrix);
+		
+					// Calcular distancia matemática Rayo <-> Segmento
+					const distSq = ray.distanceSqToSegment(p1World, p2World, ptOnRay, ptOnSeg);
+		
+					if (distSq < threshold) {
+						// AQUÍ ESTÁ LA LÓGICA ROBUSTA:
+						// Calculamos qué tan lejos está este borde de la cámara
+						const distanceToCamera = ray.origin.distanceTo(ptOnSeg);
+		
+						// Si el borde está más lejos que la pared visible del objeto, LO IGNORAMOS.
+						if (distanceToCamera < visibleDistanceLimit) {
+							// Es un borde visible, comprobamos si es el más cercano al mouse
+							if (distSq < minDiff) {
+								minDiff = distSq;
+								bestEdge = { 
+									ids: [id1, id2], 
+									points: [p1World, p2World] 
+								};
+							}
+						}
+					}
+				}
+			});
+		
+			return bestEdge;
 		}	
 
         findClosestVisibleEdge(raycaster) {
@@ -362,138 +502,3 @@
                     this.gizmo.detach(); this.orbit.enabled = false; 
                     this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333)); this.state.multiSelection = []; 
                     this.connectionLine.visible = false; document.getElementById('action-container').classList.add('hidden');
-                };
-                document.getElementById('tool-connect').onclick = () => {
-                    this.state.editTool = 'connect'; this.updateToolUI('tool-connect');
-                    document.getElementById('status').innerText = "Toca 2 vértices";
-                    this.gizmo.detach(); this.orbit.enabled = true;
-                    this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333)); this.state.multiSelection = []; 
-                    this.connectionLine.visible = false; document.getElementById('action-container').classList.add('hidden');
-                };
-                document.getElementById('btn-connect-action').onclick = () => this.performConnection();
-                document.getElementById('btn-export').onclick = () => this.exportGLB(); 
-                const setMode = (mode, id) => { document.getElementById(id).onclick = () => { this.gizmo.setMode(mode); document.querySelectorAll('#transform-tools button').forEach(b => b.classList.remove('active')); document.getElementById(id).classList.add('active'); }}; setMode('translate', 'mode-translate'); setMode('rotate', 'mode-rotate'); setMode('scale', 'mode-scale'); 
-            }
-            updateToolUI(activeId) { document.querySelectorAll('.btn-tool').forEach(b => b.classList.remove('active')); document.getElementById(activeId).classList.add('active'); }
-            addCube() { 
-                const segs = { x:1, y:1, z:1 }; 
-                const geo = new THREE.BoxGeometry(1.5, 1.5, 1.5, segs.x, segs.y, segs.z); 
-                const mat = new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.9, metalness: 0.1, flatShading: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }); 
-                const mesh = new THREE.Mesh(geo, mat); mesh.userData.segments = segs; mesh.position.y = 0.75; 
-                this.scene.add(mesh); this.objects.push(mesh); this.selectObject(mesh); 
-            }
-			
-			            // ============================================
-            // FIX MODO 3: SELECCIÓN DE CARAS MATEMÁTICA
-            // ============================================
-            findClosestFace(raycaster) {
-                const mesh = this.state.selectedObj; if(!mesh) return null;
-                const grid = this.getStructuredHandles(mesh); if(!grid) return null;
-                const segs = mesh.userData.segments;
-
-                // Variables para matemáticas (reutilizables para rendimiento)
-                const ray = raycaster.ray;
-                const pA = new THREE.Vector3(); const pB = new THREE.Vector3();
-                const pC = new THREE.Vector3(); const pD = new THREE.Vector3();
-                const hitPoint = new THREE.Vector3();
-
-                let bestFace = null;
-                let minDst = Infinity;
-
-                // Función que verifica si el rayo cruza el Quad formado por 4 handles
-                const checkQuad = (h1, h2, h3, h4) => {
-                    if (!h1 || !h2 || !h3 || !h4) return;
-
-                    pA.copy(h1.position); pB.copy(h2.position);
-                    pC.copy(h3.position); pD.copy(h4.position);
-
-                    // Un Quad son 2 Triángulos. Probamos intersección matemática directa.
-                    // Triángulo 1: A-B-D
-                    let intersect = ray.intersectTriangle(pA, pB, pD, false, hitPoint);
-                    if (!intersect) {
-                        // Triángulo 2: B-C-D
-                        intersect = ray.intersectTriangle(pB, pC, pD, false, hitPoint);
-                    }
-
-                    if (intersect) {
-                        // Si golpea, calculamos la distancia a la cámara
-                        const dist = ray.origin.distanceTo(hitPoint);
-                        // Nos quedamos solo con la cara más cercana (Oclusión automática)
-                        if (dist < minDst) {
-                            minDst = dist;
-                            bestFace = [h1, h2, h3, h4];
-                        }
-                    }
-                };
-
-                // Barrido de Caras en los 3 Ejes (X, Y, Z)
-                // 1. Plano YZ (Caras laterales X)
-                for(let i=0; i <= segs.x; i++) {
-                    for(let j=0; j < segs.y; j++) {
-                        for(let k=0; k < segs.z; k++) {
-                            if(grid[i] && grid[i][j] && grid[i][j][k]) {
-                                checkQuad(grid[i][j][k], grid[i][j+1][k], grid[i][j+1][k+1], grid[i][j][k+1]);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Plano XZ (Caras laterales Y - Arriba/Abajo)
-                for(let j=0; j <= segs.y; j++) {
-                    for(let i=0; i < segs.x; i++) {
-                        for(let k=0; k < segs.z; k++) {
-                            if(grid[i] && grid[i][j] && grid[i][j][k]) {
-                                checkQuad(grid[i][j][k], grid[i+1][j][k], grid[i+1][j][k+1], grid[i][j][k+1]);
-                            }
-                        }
-                    }
-                }
-
-                // 3. Plano XY (Caras laterales Z - Frente/Atrás)
-                for(let k=0; k <= segs.z; k++) {
-                    for(let i=0; i < segs.x; i++) {
-                        for(let j=0; j < segs.y; j++) {
-                            if(grid[i] && grid[i][j] && grid[i][j][k]) {
-                                checkQuad(grid[i][j][k], grid[i+1][j][k], grid[i+1][j+1][k], grid[i][j+1][k]);
-                            }
-                        }
-                    }
-                }
-
-                return bestFace;
-            }
-
-			
-			setSelection(handles, label) {
-				this.state.selectedGroup = handles;
-				document.getElementById('status').innerText = label;
-			
-				if (handles.length === 1) {
-					this.gizmo.attach(handles[0]); 
-				} else {
-					const center = new THREE.Vector3();
-					handles.forEach(h => center.add(h.position));
-					center.divideScalar(handles.length);
-					
-					this.dummy.position.copy(center);
-					this.dummy.rotation.set(0,0,0);
-					this.dummy.scale.set(1,1,1);
-					this.dummy.updateMatrixWorld();
-					
-					this.gizmo.attach(this.dummy); 
-				}
-			}
-			
-			clearSelectionVisuals() {
-				if(this.edgeHighlightHelper) this.edgeHighlightHelper.visible = false;
-				if(this.faceHighlightHelper) this.faceHighlightHelper.visible = false;
-				this.state.selectedGroup = [];
-			}
-			
-            exportGLB() { this.exitEditMode(); const exporter = new GLTFExporter(); exporter.parse(this.objects, (gltf) => { const blob = new Blob([gltf], { type: 'application/octet-stream' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'modelo_smooth_cut.glb'; link.click(); }, (err) => console.error(err), { binary: true }); }
-            render() { this.orbit.update(); this.renderer.render(this.scene, this.camera); }
-        }
-        new App();
-    </script>
-  </body>
-</html>

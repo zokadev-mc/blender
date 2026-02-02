@@ -1,0 +1,149 @@
+
+
+
+                };
+                document.getElementById('tool-connect').onclick = () => {
+                    this.state.editTool = 'connect'; this.updateToolUI('tool-connect');
+                    document.getElementById('status').innerText = "Toca 2 vértices";
+                    this.gizmo.detach(); this.orbit.enabled = true;
+                    this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333)); this.state.multiSelection = []; 
+                    this.connectionLine.visible = false; document.getElementById('action-container').classList.add('hidden');
+                };
+				document.getElementById('tool-extrude').addEventListener('click', () => {
+					if(this.state.selectedFaceId !== undefined && this.state.selectedFaceId !== null) {
+						
+						// Ejecutar extrusión lógica
+						this.virtualMesh.extrudeFace(this.state.selectedFaceId, 1.0); 
+						
+						// Limpiar visuales viejos
+						this.clearHandles(); 
+						this.state.selectedObj.updateMatrixWorld(); // Importante
+				
+						// REGENERAR HANDLES (CON CORRECCIÓN DE MATRIZ)
+						Object.values(this.virtualMesh.verts).forEach(v => {
+							const localPos = new THREE.Vector3(v.x, v.y, v.z);
+							
+							// CORRECCIÓN AQUÍ TAMBIÉN:
+							const worldPos = localPos.applyMatrix4(this.state.selectedObj.matrixWorld);
+							
+							const handle = this.createHandleMesh(worldPos);
+							handle.userData.virtId = v.id;
+							this.handles.push(handle);
+							this.scene.add(handle);
+							v.handle = handle;
+						});
+						
+						this.updateGeometryFromHandles();
+						this.clearSelectionVisuals();
+					}
+				});
+                document.getElementById('btn-connect-action').onclick = () => this.performConnection();
+                document.getElementById('btn-export').onclick = () => this.exportGLB(); 
+                const setMode = (mode, id) => { document.getElementById(id).onclick = () => { this.gizmo.setMode(mode); document.querySelectorAll('#transform-tools button').forEach(b => b.classList.remove('active')); document.getElementById(id).classList.add('active'); }}; setMode('translate', 'mode-translate'); setMode('rotate', 'mode-rotate'); setMode('scale', 'mode-scale'); 
+            }
+            updateToolUI(activeId) { document.querySelectorAll('.btn-tool').forEach(b => b.classList.remove('active')); document.getElementById(activeId).classList.add('active'); }
+            addCube() { 
+                const segs = { x:1, y:1, z:1 }; 
+                const geo = new THREE.BoxGeometry(1.5, 1.5, 1.5, segs.x, segs.y, segs.z); 
+                const mat = new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.9, metalness: 0.1, flatShading: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }); 
+                const mesh = new THREE.Mesh(geo, mat); mesh.userData.segments = segs; mesh.position.y = 0.75; 
+                this.scene.add(mesh); this.objects.push(mesh); this.selectObject(mesh); 
+            }
+			
+			            // ============================================
+            // FIX MODO 3: SELECCIÓN DE CARAS MATEMÁTICA
+            // ============================================
+			findClosestFace(raycaster) {
+				if (!this.state.selectedObj || !this.virtualMesh) return null;
+			
+				// 1. Raycast estándar contra la malla visual
+				const intersects = raycaster.intersectObject(this.state.selectedObj);
+				if (intersects.length === 0) return null;
+			
+				const hit = intersects[0];
+				const faceIndex = hit.faceIndex; // Índice del triángulo en Three.js
+			
+				// 2. Mapear triángulo -> Cara Virtual
+				// Necesitamos saber qué "Cara Virtual" generó este triángulo.
+				// La forma más robusta es buscar qué cara contiene los vértices golpeados.
+				
+				// Obtenemos los índices de vértices del triángulo golpeado
+				const geo = this.state.selectedObj.geometry;
+				const a = geo.index.getX(faceIndex * 3);
+				const b = geo.index.getY(faceIndex * 3);
+				const c = geo.index.getZ(faceIndex * 3);
+			
+				// Convertir posiciones del triángulo a string para comparar (o usar proximidad)
+				// PERO: Si implementaste mi `toBufferGeometry`, los vértices se regeneran en orden.
+				// ESTRATEGIA SEGURA: Buscar geométricamente qué cara virtual está más cerca del punto de impacto.
+				
+				let bestFaceId = -1;
+				let minCenterDist = Infinity;
+				const localPoint = this.state.selectedObj.worldToLocal(hit.point.clone());
+			
+				Object.values(this.virtualMesh.faces).forEach(face => {
+					// Calcular centroide de la cara virtual
+					let cx=0, cy=0, cz=0;
+					face.verts.forEach(vid => {
+						const v = this.virtualMesh.verts[vid];
+						cx += v.x; cy += v.y; cz += v.z;
+					});
+					cx /= face.verts.length;
+					cy /= face.verts.length;
+					cz /= face.verts.length;
+			
+					const dist = localPoint.distanceTo(new THREE.Vector3(cx, cy, cz));
+					if(dist < minCenterDist) {
+						minCenterDist = dist;
+						bestFaceId = face.id;
+					}
+				});
+			
+				// Retornamos los handles correspondientes a esta cara para que se iluminen
+				if (bestFaceId !== -1) {
+					const face = this.virtualMesh.faces[bestFaceId];
+					// Buscar los handles visuales asociados a estos IDs
+					const handles = face.verts.map(vid => this.virtualMesh.verts[vid].handle).filter(h => h);
+					
+					// Guardamos el ID de la cara seleccionada en el estado global para usarlo al extruir
+					this.state.selectedFaceId = bestFaceId; 
+					
+					return handles;
+				}
+				return null;
+			}
+
+			
+			setSelection(handles, label) {
+				this.state.selectedGroup = handles;
+				document.getElementById('status').innerText = label;
+			
+				if (handles.length === 1) {
+					this.gizmo.attach(handles[0]); 
+				} else {
+					const center = new THREE.Vector3();
+					handles.forEach(h => center.add(h.position));
+					center.divideScalar(handles.length);
+					
+					this.dummy.position.copy(center);
+					this.dummy.rotation.set(0,0,0);
+					this.dummy.scale.set(1,1,1);
+					this.dummy.updateMatrixWorld();
+					
+					this.gizmo.attach(this.dummy); 
+				}
+			}
+			
+			clearSelectionVisuals() {
+				if(this.edgeHighlightHelper) this.edgeHighlightHelper.visible = false;
+				if(this.faceHighlightHelper) this.faceHighlightHelper.visible = false;
+				this.state.selectedGroup = [];
+			}
+			
+            exportGLB() { this.exitEditMode(); const exporter = new GLTFExporter(); exporter.parse(this.objects, (gltf) => { const blob = new Blob([gltf], { type: 'application/octet-stream' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'modelo_smooth_cut.glb'; link.click(); }, (err) => console.error(err), { binary: true }); }
+            render() { this.orbit.update(); this.renderer.render(this.scene, this.camera); }
+        }
+        new App();
+    </script>
+  </body>
+</html>

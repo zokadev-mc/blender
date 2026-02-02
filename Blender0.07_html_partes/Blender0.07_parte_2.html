@@ -1,6 +1,162 @@
 
 
 
+                const id2 = this.handles.indexOf(h2);
+
+                if (this.hasUserEdge(id1, id2)) {
+                    this.removeUserEdge(id1, id2); 
+                    document.getElementById('status').innerText = "Línea Disuelta (Visual)";
+                } else {
+                    this.addUserEdge(id1, id2); 
+                    
+                    const vIndices1 = []; const vIndices2 = [];
+                    this.vertexMap.forEach((handleIdx, vIdx) => {
+                        if (handleIdx === id1) vIndices1.push(vIdx);
+                        if (handleIdx === id2) vIndices2.push(vIdx);
+                    });
+
+                    if (vIndices1.length > 0 && vIndices2.length > 0) {
+                        const indexAttr = mesh.geometry.index;
+                        const indices = indexAttr.array;
+                        const isG1 = (i) => vIndices1.includes(i);
+                        const isG2 = (i) => vIndices2.includes(i);
+                        
+                        let success = false;
+                        const trisP1 = [];
+                        for(let i=0; i<indices.length; i+=3) {
+                            if(isG1(indices[i]) || isG1(indices[i+1]) || isG1(indices[i+2])) trisP1.push(i);
+                        }
+
+                        const replaceInTri = (baseIdx, oldVal, newVal) => {
+                            if(indices[baseIdx] == oldVal) indices[baseIdx] = newVal;
+                            else if(indices[baseIdx+1] == oldVal) indices[baseIdx+1] = newVal;
+                            else if(indices[baseIdx+2] == oldVal) indices[baseIdx+2] = newVal;
+                        };
+
+                        for (let t1 of trisP1) {
+                            if(success) break;
+                            const vA = [indices[t1], indices[t1+1], indices[t1+2]];
+                            for(let t2=0; t2<indices.length; t2+=3) {
+                                if(t1 === t2) continue;
+                                const vB = [indices[t2], indices[t2+1], indices[t2+2]];
+                                const shared = vA.filter(v => vB.includes(v));
+                                if(shared.length === 2) {
+                                    const uniqueA = vA.find(v => !shared.includes(v));
+                                    const uniqueB = vB.find(v => !shared.includes(v));
+                                    const p1InShared = shared.some(v => isG1(v));
+                                    const p2InShared = shared.some(v => isG2(v));
+                                    
+                                    if(p1InShared && p2InShared) {
+                                        success = true; break; 
+                                    }
+
+                                    const isConnectCase = (isG1(uniqueA) && isG2(uniqueB)) || (isG1(uniqueB) && isG2(uniqueA));
+                                    if(isConnectCase) {
+                                        const s0 = shared[0]; const s1 = shared[1];
+                                        replaceInTri(t1, s1, uniqueB); replaceInTri(t2, s0, uniqueA);
+                                        success = true; document.getElementById('status').innerText = "Conexión Creada"; break;
+                                    }
+                                }
+                            }
+                        }
+                        if(success) { mesh.geometry.index.needsUpdate = true; mesh.geometry.computeVertexNormals(); }
+                    }
+                }
+
+                this.setupDirectWireframe(mesh);
+
+                this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333));
+                this.state.multiSelection = [];
+                this.connectionLine.visible = false;
+                document.getElementById('action-container').classList.add('hidden');
+            }
+
+            updateWireframeRealtime() {
+                const mesh = this.state.selectedObj; if(!mesh) return;
+                
+                if(this.wireframeHelper) { 
+                    mesh.remove(this.wireframeHelper); 
+                    if(this.wireframeHelper.geometry) this.wireframeHelper.geometry.dispose();
+                    this.wireframeHelper = null;
+                }
+                
+                let geometry;
+                if (this.state.wireframeMode === 'full') {
+                    geometry = new THREE.WireframeGeometry(mesh.geometry);
+                } else {
+                    const grid = this.getStructuredHandles(mesh);
+                    if (!grid) return;
+                    
+                    const segs = mesh.userData.segments;
+                    const nx = grid.length; 
+                    const ny = grid[0].length; 
+                    const nz = grid[0][0].length;
+                    const newPoints = [];
+
+                    const getPos = (i,j,k) => {
+                        const p = grid[i][j][k].position.clone();
+                        mesh.worldToLocal(p);
+                        return p;
+                    };
+
+                    for(let i=0; i<nx; i++) {
+                        for(let j=0; j<ny; j++) {
+                            for(let k=0; k<nz; k++) {
+                                const p = getPos(i,j,k);
+                                if (i < nx - 1) { const px = getPos(i+1, j, k); newPoints.push(p.x, p.y, p.z, px.x, px.y, px.z); }
+                                if (j < ny - 1) { const py = getPos(i, j+1, k); newPoints.push(p.x, p.y, p.z, py.x, py.y, py.z); }
+                                if (k < nz - 1) { const pz = getPos(i, j, k+1); newPoints.push(p.x, p.y, p.z, pz.x, pz.y, pz.z); }
+                            }
+                        }
+                    }
+
+                    this.state.userEdges.forEach(pairStr => {
+                        const parts = pairStr.split('_');
+                        const h1 = this.handles[parseInt(parts[0])];
+                        const h2 = this.handles[parseInt(parts[1])];
+                        if (h1 && h2) {
+                            const p1 = h1.position.clone(); mesh.worldToLocal(p1);
+                            const p2 = h2.position.clone(); mesh.worldToLocal(p2);
+                            newPoints.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+                        }
+                    });
+
+                    geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(newPoints, 3));
+                }
+
+                const mat = new THREE.LineBasicMaterial({ color: 0xffaa00, depthTest: false, opacity: 1, transparent: false });
+                this.wireframeHelper = new THREE.LineSegments(geometry, mat);
+                this.wireframeHelper.renderOrder = 999;
+                mesh.add(this.wireframeHelper);
+            }
+			
+			toggleWireframeMode() {
+				// Alternar entre modos
+				if (this.state.wireframeMode === 'clean') {
+				this.state.wireframeMode = 'full';
+				document.getElementById('status').innerText = "Vista: Alambre Completo";
+    } else {
+        this.state.wireframeMode = 'clean';
+        document.getElementById('status').innerText = "Vista: Limpia";
+    }
+    
+    // Forzar actualización visual
+    if (this.state.selectedObj) {
+        this.updateWireframeRealtime();
+    }
+}
+
+            updateKnifeVisuals(mouseEvent, phase) {
+                if(!this.state.selectedObj) return;
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                
+                const getScreenPos = (vec3) => {
+                    const v = vec3.clone().project(this.camera);
+                    return new THREE.Vector2(
+                        (v.x * .5 + .5) * rect.width + rect.left,
+                        -(v.y * .5 - .5) * rect.height + rect.top
+                    );
                 };
 
                 const mouseNDS = new THREE.Vector2(
@@ -137,74 +293,62 @@
             }
 
             setupDirectWireframe(mesh) {
-                if(this.wireframeHelper) { 
-                    this.state.selectedObj.remove(this.wireframeHelper); 
-                    if(this.wireframeHelper.geometry) this.wireframeHelper.geometry.dispose(); 
-                    this.wireframeHelper = null; 
-                }
-
-                const geometry = new THREE.BufferGeometry();
-                const posAttr = mesh.geometry.getAttribute('position');
-                const indices = []; 
-                const segs = mesh.userData.segments; 
-                let vOffset = 0;
-
-                const buildFaceGrid = (uSegs, vSegs) => { 
-                    const rowVerts = uSegs + 1; 
-                    const colVerts = vSegs + 1; 
-                    for(let y=0; y < colVerts; y++) { 
-                        for(let x=0; x < rowVerts; x++) { 
-                            const i = vOffset + y * rowVerts + x; 
-                            if(x < uSegs) indices.push(i, i + 1); 
-                            if(y < vSegs) indices.push(i, i + rowVerts); 
-                        } 
-                    } 
-                    vOffset += rowVerts * colVerts; 
-                };
-
-                buildFaceGrid(segs.z, segs.y); // X+
-                buildFaceGrid(segs.z, segs.y); // X-
-                buildFaceGrid(segs.x, segs.z); // Y+
-                buildFaceGrid(segs.x, segs.z); // Y-
-                buildFaceGrid(segs.x, segs.y); // Z+
-                buildFaceGrid(segs.x, segs.y); // Z-
-
-                const extraPoints = [];
-                if (this.state.userEdges && this.state.userEdges.length > 0) {
-                    this.state.userEdges.forEach(pairStr => {
-                        const parts = pairStr.split('_');
-                        const h1 = this.handles[parseInt(parts[0])];
-                        const h2 = this.handles[parseInt(parts[1])];
-                        
-                        if (h1 && h2) {
-                            const p1 = h1.position.clone(); mesh.worldToLocal(p1);
-                            const p2 = h2.position.clone(); mesh.worldToLocal(p2);
-                            extraPoints.push(p1, p2);
-                        }
-                    });
-                }
-
-                const finalPositions = [];
-                
-                for(let i=0; i<indices.length; i+=2) {
-                    const idx1 = indices[i];
-                    const idx2 = indices[i+1];
-                    const v1 = new THREE.Vector3().fromBufferAttribute(posAttr, idx1);
-                    const v2 = new THREE.Vector3().fromBufferAttribute(posAttr, idx2);
-                    finalPositions.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
-                }
-
-                extraPoints.forEach(p => {
-                    finalPositions.push(p.x, p.y, p.z);
-                });
-
-                geometry.setAttribute('position', new THREE.Float32BufferAttribute(finalPositions, 3));
-
-                const material = new THREE.LineBasicMaterial({ color: 0xff5500, depthTest: true, opacity: 1 });
-                
-                this.wireframeHelper = new THREE.LineSegments(geometry, material);
-                mesh.add(this.wireframeHelper);
-            }
+				// 1. Limpieza previa
+				if(this.wireframeHelper) { 
+					mesh.remove(this.wireframeHelper); 
+					if(this.wireframeHelper.geometry) this.wireframeHelper.geometry.dispose(); 
+					this.wireframeHelper = null; 
+				}
+			
+				// Solo funciona si tenemos datos lógicos
+				if (!this.virtualMesh) return;
+			
+				const positions = [];
+				const processedEdges = new Set(); // Para no dibujar la misma línea dos veces
+			
+				// 2. Recorrer cada cara virtual para extraer bordes
+				Object.values(this.virtualMesh.faces).forEach(face => {
+					const verts = face.verts;
+					for (let i = 0; i < verts.length; i++) {
+						const id1 = verts[i];
+						const id2 = verts[(i + 1) % verts.length]; // Conectar con el siguiente
+						
+						// Crear una clave única para el borde (ej: "5_12") ordenando menor_mayor
+						const key = (id1 < id2) ? `${id1}_${id2}` : `${id2}_${id1}`;
+						
+						if (!processedEdges.has(key)) {
+							processedEdges.add(key); // Marcar como dibujado
+							
+							// Obtener posiciones LOCALES (porque el helper será hijo del mesh)
+							const v1 = this.virtualMesh.verts[id1];
+							const v2 = this.virtualMesh.verts[id2];
+							
+							positions.push(v1.x, v1.y, v1.z);
+							positions.push(v2.x, v2.y, v2.z);
+						}
+					}
+				});
+			
+				// 3. Crear Geometría de Líneas
+				const geometry = new THREE.BufferGeometry();
+				geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+			
+				// 4. Material "No-XRay"
+				// depthTest: true hace que las líneas se oculten detrás del objeto sólido
+				const material = new THREE.LineBasicMaterial({ 
+					color: 0xff5500, // Naranja Blender
+					depthTest: true, 
+					opacity: 1
+				});
+				
+				this.wireframeHelper = new THREE.LineSegments(geometry, material);
+				
+				// IMPORTANTE: Para evitar el "Z-Fighting" (parpadeo de líneas), 
+				// asegúrate de que tu material del objeto tenga polygonOffset.
+				// Si usas el material azul por defecto del código anterior, ya lo tiene.
+				
+				mesh.add(this.wireframeHelper);
+			}
 
             resetKnifeTool() {
                 this.state.knifeStep = 0; this.state.activeEdge = null; this.state.isCutting = false;
@@ -303,201 +447,58 @@
             }
 
             enterEditMode(resetPositions = true) {
-                const mesh = this.state.selectedObj; if (!mesh) return;
-
-                if(resetPositions) {
-                    const freshGeo = mesh.geometry.clone();
-                    mesh.geometry.dispose();
-                    mesh.geometry = freshGeo;
-                }
-
-                this.state.mode = 'edit'; this.gizmo.detach();
-                
-                if(resetPositions || this.handles.length === 0) { 
-                    this.clearHandles(); 
-                    this.vertexMap = [];
-                    mesh.geometry.computeBoundingBox(); 
-                }
-
-				document.getElementById('sub-mode-bar').classList.remove('hidden');
-                document.getElementById('edit-tools-bar').classList.remove('hidden');
-                document.getElementById('transform-tools').classList.add('hidden');
-
-                if(this.handles.length === 0) {
-                    const posAttr = mesh.geometry.attributes.position;
-                    mesh.updateMatrixWorld();
-                    
-                    for(let i=0; i < posAttr.count; i++) {
-                        const vPos = new THREE.Vector3().fromBufferAttribute(posAttr, i);
-                        vPos.applyMatrix4(mesh.matrixWorld);
-                        let handleIdx = -1;
-                        
-                        for(let h=0; h < this.handles.length; h++) { 
-                            if(this.handles[h].position.distanceTo(vPos) < 0.001) { 
-                                handleIdx = h; break; 
-                            } 
-                        }
-                        
-                        if(handleIdx === -1) { 
-                            const handle = this.createHandleMesh(vPos); 
-                            this.handles.push(handle); 
-                            this.scene.add(handle); 
-                            handleIdx = this.handles.length - 1; 
-                        }
-                        this.vertexMap[i] = handleIdx;
-                    }
-                    if (!mesh.userData.gridInfo) this.cacheGridIndices(mesh);
-                }
-
-                if (mesh.userData.userEdges) {
-                    this.state.userEdges = [...mesh.userData.userEdges];
-                } else {
-                    this.state.userEdges = [];
-                    mesh.userData.userEdges = [];
-                }
-
-                this.setupDirectWireframe(mesh);
-                document.getElementById('status').innerText = "Modo Edición";
-            }
-
-            cacheGridIndices(mesh) {
-                const segs = mesh.userData.segments;
-                const nx = segs.x + 1;
-                const ny = segs.y + 1;
-                const nz = segs.z + 1;
-
-                mesh.geometry.computeBoundingBox();
-                const min = mesh.geometry.boundingBox.min;
-                const max = mesh.geometry.boundingBox.max;
-                const size = new THREE.Vector3().subVectors(max, min);
-
-                if(size.x === 0) size.x = 1;
-                if(size.y === 0) size.y = 1;
-                if(size.z === 0) size.z = 1;
-
-                if(!mesh.userData.gridInfo) mesh.userData.gridInfo = [];
-
-                this.handles.forEach((h, hIdx) => {
-                    const localPos = h.position.clone();
-                    mesh.worldToLocal(localPos);
-
-                    const percentX = (localPos.x - min.x) / size.x;
-                    const percentY = (localPos.y - min.y) / size.y;
-                    const percentZ = (localPos.z - min.z) / size.z;
-
-                    const ix = Math.max(0, Math.min(nx - 1, Math.round(percentX * segs.x)));
-                    const iy = Math.max(0, Math.min(ny - 1, Math.round(percentY * segs.y)));
-                    const iz = Math.max(0, Math.min(nz - 1, Math.round(percentZ * segs.z)));
-
-                    const vIdx = this.vertexMap.indexOf(hIdx);
-                    if (vIdx !== -1) {
-                         mesh.userData.gridInfo[vIdx] = { x: ix, y: iy, z: iz };
-                    }
-                });
-            }
+				const mesh = this.state.selectedObj; 
+				if (!mesh) return;
 			
-			generateSpatialGrid(mesh) {
-                const segs = mesh.userData.segments;
-                const nx = segs.x + 1;
-                const ny = segs.y + 1;
-                const nz = segs.z + 1;
-
-                const items = this.handles.map(h => {
-                    const localPos = h.position.clone();
-                    mesh.worldToLocal(localPos);
-                    return { h, x: localPos.x, y: localPos.y, z: localPos.z };
-                });
-
-                const EPSILON = 0.001; 
-
-                const gapSort = (arr, prop) => {
-                    arr.sort((a,b) => a[prop] - b[prop]); 
-                    const buckets = [];
-                    if (arr.length === 0) return buckets;
-                    let currentBucket = [arr[0]];
-                    buckets.push(currentBucket);
-                    for (let i = 1; i < arr.length; i++) {
-                        if (Math.abs(arr[i][prop] - arr[i-1][prop]) > EPSILON) {
-                            currentBucket = [arr[i]];
-                            buckets.push(currentBucket);
-                        } else {
-                            currentBucket.push(arr[i]);
-                        }
-                    }
-                    return buckets;
-                };
-
-                const grid = [];
-                const xBuckets = gapSort(items, 'x');
-                
-                if(xBuckets.length > nx) {
-                     xBuckets.sort((a,b) => b.length - a.length);
-                     const selected = xBuckets.slice(0, nx).sort((a,b) => a[0].x - b[0].x);
-                     xBuckets.length = 0; xBuckets.push(...selected);
-                }
-                
-                for(let i=0; i<nx; i++) {
-                    grid[i] = [];
-                    const xItems = xBuckets[i] || xBuckets[xBuckets.length-1]; 
-                    
-                    const yBuckets = gapSort(xItems, 'y');
-                    
-                    if(yBuckets.length > ny) {
-                         yBuckets.sort((a,b) => b.length - a.length);
-                         const selected = yBuckets.slice(0, ny).sort((a,b) => a[0].y - b[0].y);
-                         yBuckets.length = 0; yBuckets.push(...selected);
-                    }
-
-                    for(let j=0; j<ny; j++) {
-                        const yItems = yBuckets[j] || yBuckets[yBuckets.length-1]; 
-                        
-                        yItems.sort((a,b) => a.z - b.z);
-
-                        grid[i][j] = [];
-                        for(let k=0; k<nz; k++) {
-                            const item = yItems[k] || yItems[yItems.length-1]; 
-                            grid[i][j][k] = item.h;
-                        }
-                    }
-                }
-                return grid;
-            }
-
-            getStructuredHandles(mesh) {
-                if (mesh.userData.gridInfo && this.vertexMap.length > 0) {
-                    const segs = mesh.userData.segments;
-                    const nx = segs.x + 1, ny = segs.y + 1, nz = segs.z + 1;
-                    
-                    const grid = Array(nx).fill().map(() => Array(ny).fill().map(() => Array(nz).fill(null)));
-                    
-                    let dataCount = 0;
-                    
-                    this.handles.forEach((h, hIdx) => {
-                        const vIdx = this.vertexMap.indexOf(hIdx);
-                        if(vIdx !== -1 && mesh.userData.gridInfo[vIdx]) {
-                            const {x, y, z} = mesh.userData.gridInfo[vIdx];
-                            if(x < nx && y < ny && z < nz) {
-                                grid[x][y][z] = h;
-                                dataCount++;
-                            }
-                        }
-                    });
-
-                    if (dataCount > 0) return grid;
-                }
-                
-                this.cacheGridIndices(mesh);
-                return this.getStructuredHandles(mesh);
-            }
+				this.state.mode = 'edit';
+				this.gizmo.detach();
+				this.clearHandles(); 
 			
-            exitEditMode() {
-                this.state.mode = 'object'; this.state.editTool = 'select'; 
-                this.resetKnifeTool(); this.orbit.enabled = true;
-                this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333));
-                this.state.multiSelection = [];
-                this.connectionLine.visible = false;
-                document.getElementById('action-container').classList.add('hidden');
-                
-                document.getElementById('tool-select').click();
-                this.clearHandles(); 
-                if(this.wireframeHelper) { this.state.selectedObj.remove(this.wireframeHelper); this.wireframeHelper = null; }
+				// Forzar actualización de matrices para evitar errores de posición
+				mesh.updateMatrixWorld(true);
+			
+				// LÓGICA DE CARGA INTELIGENTE
+				// 1. ¿Tiene datos guardados? -> Cárgalos
+				if (mesh.userData.vmData) {
+					console.log("Restaurando malla modificada...");
+					this.virtualMesh = VirtualMesh.fromJSON(mesh.userData.vmData);
+				} 
+				// 2. ¿No tiene datos? -> Crea la inicial (Bounding Box)
+				else if (!this.virtualMesh || resetPositions) {
+					console.log("Creando malla inicial...");
+					this.virtualMesh = new VirtualMesh();
+					
+					// ... (Aquí va tu código de BoundingBox que hicimos en el paso anterior) ...
+					const geo = mesh.geometry;
+					geo.computeBoundingBox();
+					const box = geo.boundingBox;
+					const rx = (box.max.x - box.min.x) / 2;
+					const ry = (box.max.y - box.min.y) / 2;
+					const rz = (box.max.z - box.min.z) / 2;
+					
+					// ... (Tus addVert y addFace iniciales) ...
+					const v0 = this.virtualMesh.addVert(-rx, -ry,  rz);
+					const v1 = this.virtualMesh.addVert( rx, -ry,  rz);
+					const v2 = this.virtualMesh.addVert(-rx,  ry,  rz);
+					const v3 = this.virtualMesh.addVert( rx,  ry,  rz);
+					const v4 = this.virtualMesh.addVert(-rx, -ry, -rz);
+					const v5 = this.virtualMesh.addVert( rx, -ry, -rz);
+					const v6 = this.virtualMesh.addVert(-rx,  ry, -rz);
+					const v7 = this.virtualMesh.addVert( rx,  ry, -rz);
+			
+					this.virtualMesh.addFace([v0, v1, v3, v2]);
+					this.virtualMesh.addFace([v5, v4, v6, v7]);
+					this.virtualMesh.addFace([v4, v0, v2, v6]);
+					this.virtualMesh.addFace([v1, v5, v7, v3]);
+					this.virtualMesh.addFace([v2, v3, v7, v6]);
+					this.virtualMesh.addFace([v4, v5, v1, v0]);
+				}
+			
+				// 3. Crear Handles (Esto sigue igual, usando requestAnimationFrame por seguridad)
+				requestAnimationFrame(() => {
+					Object.values(this.virtualMesh.verts).forEach(v => {
+						const localPos = new THREE.Vector3(v.x, v.y, v.z);
+						const worldPos = localPos.applyMatrix4(mesh.matrixWorld);
+						const worldPos = localPos.applyMatrix4(mesh.matrixWorld);
+			
+						const handle = this.createHandleMesh(worldPos);
