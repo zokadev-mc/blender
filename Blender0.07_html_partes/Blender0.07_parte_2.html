@@ -1,0 +1,503 @@
+
+
+
+                };
+
+                const mouseNDS = new THREE.Vector2(
+                    ((mouseEvent.clientX - rect.left)/rect.width)*2-1, 
+                    -((mouseEvent.clientY - rect.top)/rect.height)*2+1
+                );
+                const mousePx = new THREE.Vector2(mouseEvent.clientX, mouseEvent.clientY);
+
+                if (phase === 'search') {
+                    const raycaster = new THREE.Raycaster(); raycaster.setFromCamera(mouseNDS, this.camera);
+                    const edge = this.findClosestEdge(raycaster);
+                    
+                    if(edge) {
+                        this.state.activeEdge = edge;
+                        const fullLinePoints = this.getFullEdgeLine(edge);
+                        this.edgeHighlightHelper.geometry.setFromPoints(fullLinePoints);
+                        this.edgeHighlightHelper.material.color.setHex(0xffff00); 
+                        this.edgeHighlightHelper.visible = true;
+                        this.cutPreviewHelper.visible = false;
+                        document.getElementById('status').innerText = "Loop Detectado";
+                    } else {
+                        this.edgeHighlightHelper.visible = false;
+                        this.cutPreviewHelper.visible = false;
+                        this.state.activeEdge = null;
+                        document.getElementById('status').innerText = "Cuchillo: Selecciona un borde";
+                    }
+                }
+                
+                else if (phase === 'select') {
+                    if (this.state.activeEdge) {
+                        this.state.knifeStep = 1;
+                        this.edgeHighlightHelper.material.color.setHex(0x00ff00); 
+                        
+                        this.cutPreviewHelper.visible = false; 
+                        
+                        document.getElementById('status').innerText = "Arrastra para ajustar";
+
+                        const edge = this.state.activeEdge;
+                        const grid = this.getStructuredHandles(this.state.selectedObj);
+                        const { axis, x, y, z } = edge;
+                        const segs = this.state.selectedObj.userData.segments;
+                        const options = [];
+
+                        if (axis === 'y') {
+                            options.push({ start: grid[0][y][z].position, end: grid[segs.x][y][z].position, axis: 'x', range: segs.x });
+                            options.push({ start: grid[x][y][0].position, end: grid[x][y][segs.z].position, axis: 'z', range: segs.z });
+                        }
+                        else if (axis === 'x' || axis === 'z') {
+                            options.push({ start: grid[x][0][z].position, end: grid[x][segs.y][z].position, axis: 'y', range: segs.y });
+                        }
+                        this.state.cutOptions = options;
+                    }
+                }
+
+                else if (phase === 'cut_start' || phase === 'cut_move') {
+                    if (phase === 'cut_start') this.state.knifeStep = 2;
+
+                    let bestOption = null, bestDist = Infinity;
+                    const options = this.state.cutOptions;
+
+                    if (!options || options.length === 0) return;
+
+                    options.forEach(opt => {
+                        const p1 = getScreenPos(opt.start);
+                        const p2 = getScreenPos(opt.end);
+                        const l2 = p1.distanceToSquared(p2);
+                        if (l2 < 1) return;
+                        
+                        let t = ((mousePx.x - p1.x) * (p2.x - p1.x) + (mousePx.y - p1.y) * (p2.y - p1.y)) / l2;
+                        t = Math.max(0, Math.min(1, t));
+                        const proj = new THREE.Vector2().copy(p1).lerp(p2, t);
+                        const d = mousePx.distanceTo(proj);
+                        
+                        if (d < bestDist) { bestDist = d; bestOption = opt; }
+                    });
+
+                    if (!bestOption) bestOption = (this.state.dragInfo && this.state.dragInfo.ruler) || options[0];
+
+                    if (!this.state.dragInfo || this.state.dragInfo.ruler !== bestOption) {
+                        
+                        const p1 = getScreenPos(bestOption.start);
+                        const p2 = getScreenPos(bestOption.end);
+                        const lineVec = new THREE.Vector2().subVectors(p2, p1);
+                        const screenLength = lineVec.length();
+                        
+                        let currentAbsT = mousePx.clone().sub(p1).dot(lineVec) / (screenLength * screenLength);
+                        currentAbsT = Math.max(0, Math.min(1, currentAbsT));
+
+                        this.state.dragInfo = {
+                            startMouse: mousePx.clone(),
+                            startT: currentAbsT,
+                            lineVecNorm: lineVec.normalize(),
+                            virtualLength: 400,             
+                            ruler: bestOption
+                        };
+                        
+                        this.cutPreviewHelper.visible = true;
+                    }
+
+                    const drag = this.state.dragInfo;
+                    const delta = new THREE.Vector2().subVectors(mousePx, drag.startMouse);
+                    const moveProj = delta.dot(drag.lineVecNorm);
+                    
+                    let newT = drag.startT + (moveProj / drag.virtualLength);
+                    newT = Math.max(0.01, Math.min(0.99, newT));
+                    
+                    this.updateCutVisualsInternal(newT, drag.ruler);
+                    this.state.slideRuler = drag.ruler;
+                }
+
+                else if (phase === 'apply') {
+                    if (this.cutPreviewHelper.visible && this.state.slideRuler) {
+                        const ruler = this.state.slideRuler;
+                        const totalSegs = ruler.range;
+                        const globalVal = this.state.cutRatio * totalSegs;
+                        const index = Math.min(Math.floor(globalVal), totalSegs - 1);
+                        const localRatio = Math.max(0.01, Math.min(0.99, globalVal - index));
+                        this.applyCut(ruler.axis, index, localRatio);
+                    }
+                    this.resetKnifeTool();
+                    this.state.dragInfo = null;
+                }
+            }
+
+            updateCutVisualsInternal(t, ruler) {
+                this.state.cutRatio = t;
+                const totalSegs = ruler.range;
+                const globalVal = t * totalSegs;
+                const index = Math.floor(globalVal);
+                const localRatio = globalVal - index;
+                const safeIndex = Math.min(index, totalSegs - 1);
+                const safeRatio = (index >= totalSegs) ? 0.99 : localRatio;
+                this.drawLoopPreview(ruler.axis, safeIndex, safeRatio);
+            }
+
+            setupDirectWireframe(mesh) {
+                if(this.wireframeHelper) { 
+                    this.state.selectedObj.remove(this.wireframeHelper); 
+                    if(this.wireframeHelper.geometry) this.wireframeHelper.geometry.dispose(); 
+                    this.wireframeHelper = null; 
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                const posAttr = mesh.geometry.getAttribute('position');
+                const indices = []; 
+                const segs = mesh.userData.segments; 
+                let vOffset = 0;
+
+                const buildFaceGrid = (uSegs, vSegs) => { 
+                    const rowVerts = uSegs + 1; 
+                    const colVerts = vSegs + 1; 
+                    for(let y=0; y < colVerts; y++) { 
+                        for(let x=0; x < rowVerts; x++) { 
+                            const i = vOffset + y * rowVerts + x; 
+                            if(x < uSegs) indices.push(i, i + 1); 
+                            if(y < vSegs) indices.push(i, i + rowVerts); 
+                        } 
+                    } 
+                    vOffset += rowVerts * colVerts; 
+                };
+
+                buildFaceGrid(segs.z, segs.y); // X+
+                buildFaceGrid(segs.z, segs.y); // X-
+                buildFaceGrid(segs.x, segs.z); // Y+
+                buildFaceGrid(segs.x, segs.z); // Y-
+                buildFaceGrid(segs.x, segs.y); // Z+
+                buildFaceGrid(segs.x, segs.y); // Z-
+
+                const extraPoints = [];
+                if (this.state.userEdges && this.state.userEdges.length > 0) {
+                    this.state.userEdges.forEach(pairStr => {
+                        const parts = pairStr.split('_');
+                        const h1 = this.handles[parseInt(parts[0])];
+                        const h2 = this.handles[parseInt(parts[1])];
+                        
+                        if (h1 && h2) {
+                            const p1 = h1.position.clone(); mesh.worldToLocal(p1);
+                            const p2 = h2.position.clone(); mesh.worldToLocal(p2);
+                            extraPoints.push(p1, p2);
+                        }
+                    });
+                }
+
+                const finalPositions = [];
+                
+                for(let i=0; i<indices.length; i+=2) {
+                    const idx1 = indices[i];
+                    const idx2 = indices[i+1];
+                    const v1 = new THREE.Vector3().fromBufferAttribute(posAttr, idx1);
+                    const v2 = new THREE.Vector3().fromBufferAttribute(posAttr, idx2);
+                    finalPositions.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+                }
+
+                extraPoints.forEach(p => {
+                    finalPositions.push(p.x, p.y, p.z);
+                });
+
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(finalPositions, 3));
+
+                const material = new THREE.LineBasicMaterial({ color: 0xff5500, depthTest: true, opacity: 1 });
+                
+                this.wireframeHelper = new THREE.LineSegments(geometry, material);
+                mesh.add(this.wireframeHelper);
+            }
+
+            resetKnifeTool() {
+                this.state.knifeStep = 0; this.state.activeEdge = null; this.state.isCutting = false;
+                this.edgeHighlightHelper.visible = false; this.cutPreviewHelper.visible = false;
+                this.edgeHighlightHelper.material.color.setHex(0xffff00); document.getElementById('status').innerText = "Cuchillo: Selecciona un borde";
+            }
+
+            applyCut(axis, index, ratio) {
+                const mesh = this.state.selectedObj; 
+                if(!mesh) return;
+
+                const grid = this.getStructuredHandles(mesh);
+                if (!grid) {
+                    console.error("Error: No se pudo leer la estructura del objeto.");
+                    return;
+                }
+
+                const segs = mesh.userData.segments;
+                const old_nx = segs.x + 1, old_ny = segs.y + 1, old_nz = segs.z + 1;
+                const newPositions = [];
+                const lerpHandles = (h1, h2, t) => h1.position.clone().lerp(h2.position.clone(), t);
+
+                try {
+                    if(axis === 'x') { 
+                        for(let i=0; i < old_nx; i++) { 
+                            for(let j=0; j<old_ny; j++) for(let k=0; k<old_nz; k++) {
+                                if(grid[i][j][k]) newPositions.push(grid[i][j][k].position.clone());
+                                else newPositions.push(new THREE.Vector3()); 
+                            }
+                            if(i === index) {
+                                for(let j=0; j<old_ny; j++) for(let k=0; k<old_nz; k++) {
+                                    if(grid[i][j][k] && grid[i+1][j][k]) newPositions.push(lerpHandles(grid[i][j][k], grid[i+1][j][k], ratio));
+                                    else newPositions.push(new THREE.Vector3());
+                                }
+                            }
+                        } segs.x++; 
+                    } 
+                    else if(axis === 'y') { 
+                        for(let i=0; i<old_nx; i++) { 
+                            for(let j=0; j<old_ny; j++) { 
+                                for(let k=0; k<old_nz; k++) {
+                                    if(grid[i][j][k]) newPositions.push(grid[i][j][k].position.clone());
+                                    else newPositions.push(new THREE.Vector3());
+                                }
+                                if(j === index) {
+                                    for(let k=0; k<old_nz; k++) {
+                                        if(grid[i][j][k] && grid[i][j+1][k]) newPositions.push(lerpHandles(grid[i][j][k], grid[i][j+1][k], ratio));
+                                        else newPositions.push(new THREE.Vector3());
+                                    }
+                                }
+                            } 
+                        } segs.y++; 
+                    }
+                    else if(axis === 'z') { 
+                        for(let i=0; i<old_nx; i++) { 
+                            for(let j=0; j<old_ny; j++) { 
+                                for(let k=0; k<old_nz; k++) { 
+                                    if(grid[i][j][k]) newPositions.push(grid[i][j][k].position.clone());
+                                    else newPositions.push(new THREE.Vector3());
+                                    
+                                    if(k === index) {
+                                        if(grid[i][j][k] && grid[i][j][k+1]) newPositions.push(lerpHandles(grid[i][j][k], grid[i][j][k+1], ratio));
+                                        else newPositions.push(new THREE.Vector3());
+                                    }
+                                } 
+                            } 
+                        } segs.z++; 
+                    }
+                } catch (e) {
+                    console.error("Error calculando corte:", e);
+                    return; 
+                }
+
+                const newGeo = new THREE.BoxGeometry(1.5, 1.5, 1.5, segs.x, segs.y, segs.z);
+                mesh.geometry.dispose(); 
+                mesh.geometry = newGeo;
+                
+                mesh.userData.gridInfo = null;
+                
+                this.enterEditMode(true); 
+
+                const currentStructured = this.getStructuredHandles(mesh);
+                const targetOrder = [];
+                const n_nx = segs.x + 1, n_ny = segs.y + 1, n_nz = segs.z + 1;
+
+                if(axis === 'x') for(let i=0; i<n_nx; i++) for(let j=0; j<n_ny; j++) for(let k=0; k<n_nz; k++) targetOrder.push(currentStructured[i][j][k]);
+                else if(axis === 'y') for(let i=0; i<n_nx; i++) for(let j=0; j<n_ny; j++) for(let k=0; k<n_nz; k++) targetOrder.push(currentStructured[i][j][k]);
+                else for(let i=0; i<n_nx; i++) for(let j=0; j<n_ny; j++) for(let k=0; k<n_nz; k++) targetOrder.push(currentStructured[i][j][k]);
+
+                for(let i=0; i<targetOrder.length; i++) {
+                    if(targetOrder[i] && newPositions[i]) {
+                        targetOrder[i].position.copy(newPositions[i]);
+                    }
+                }
+                this.updateGeometryFromHandles();
+            }
+
+            enterEditMode(resetPositions = true) {
+                const mesh = this.state.selectedObj; if (!mesh) return;
+
+                if(resetPositions) {
+                    const freshGeo = mesh.geometry.clone();
+                    mesh.geometry.dispose();
+                    mesh.geometry = freshGeo;
+                }
+
+                this.state.mode = 'edit'; this.gizmo.detach();
+                
+                if(resetPositions || this.handles.length === 0) { 
+                    this.clearHandles(); 
+                    this.vertexMap = [];
+                    mesh.geometry.computeBoundingBox(); 
+                }
+
+				document.getElementById('sub-mode-bar').classList.remove('hidden');
+                document.getElementById('edit-tools-bar').classList.remove('hidden');
+                document.getElementById('transform-tools').classList.add('hidden');
+
+                if(this.handles.length === 0) {
+                    const posAttr = mesh.geometry.attributes.position;
+                    mesh.updateMatrixWorld();
+                    
+                    for(let i=0; i < posAttr.count; i++) {
+                        const vPos = new THREE.Vector3().fromBufferAttribute(posAttr, i);
+                        vPos.applyMatrix4(mesh.matrixWorld);
+                        let handleIdx = -1;
+                        
+                        for(let h=0; h < this.handles.length; h++) { 
+                            if(this.handles[h].position.distanceTo(vPos) < 0.001) { 
+                                handleIdx = h; break; 
+                            } 
+                        }
+                        
+                        if(handleIdx === -1) { 
+                            const handle = this.createHandleMesh(vPos); 
+                            this.handles.push(handle); 
+                            this.scene.add(handle); 
+                            handleIdx = this.handles.length - 1; 
+                        }
+                        this.vertexMap[i] = handleIdx;
+                    }
+                    if (!mesh.userData.gridInfo) this.cacheGridIndices(mesh);
+                }
+
+                if (mesh.userData.userEdges) {
+                    this.state.userEdges = [...mesh.userData.userEdges];
+                } else {
+                    this.state.userEdges = [];
+                    mesh.userData.userEdges = [];
+                }
+
+                this.setupDirectWireframe(mesh);
+                document.getElementById('status').innerText = "Modo Edición";
+            }
+
+            cacheGridIndices(mesh) {
+                const segs = mesh.userData.segments;
+                const nx = segs.x + 1;
+                const ny = segs.y + 1;
+                const nz = segs.z + 1;
+
+                mesh.geometry.computeBoundingBox();
+                const min = mesh.geometry.boundingBox.min;
+                const max = mesh.geometry.boundingBox.max;
+                const size = new THREE.Vector3().subVectors(max, min);
+
+                if(size.x === 0) size.x = 1;
+                if(size.y === 0) size.y = 1;
+                if(size.z === 0) size.z = 1;
+
+                if(!mesh.userData.gridInfo) mesh.userData.gridInfo = [];
+
+                this.handles.forEach((h, hIdx) => {
+                    const localPos = h.position.clone();
+                    mesh.worldToLocal(localPos);
+
+                    const percentX = (localPos.x - min.x) / size.x;
+                    const percentY = (localPos.y - min.y) / size.y;
+                    const percentZ = (localPos.z - min.z) / size.z;
+
+                    const ix = Math.max(0, Math.min(nx - 1, Math.round(percentX * segs.x)));
+                    const iy = Math.max(0, Math.min(ny - 1, Math.round(percentY * segs.y)));
+                    const iz = Math.max(0, Math.min(nz - 1, Math.round(percentZ * segs.z)));
+
+                    const vIdx = this.vertexMap.indexOf(hIdx);
+                    if (vIdx !== -1) {
+                         mesh.userData.gridInfo[vIdx] = { x: ix, y: iy, z: iz };
+                    }
+                });
+            }
+			
+			generateSpatialGrid(mesh) {
+                const segs = mesh.userData.segments;
+                const nx = segs.x + 1;
+                const ny = segs.y + 1;
+                const nz = segs.z + 1;
+
+                const items = this.handles.map(h => {
+                    const localPos = h.position.clone();
+                    mesh.worldToLocal(localPos);
+                    return { h, x: localPos.x, y: localPos.y, z: localPos.z };
+                });
+
+                const EPSILON = 0.001; 
+
+                const gapSort = (arr, prop) => {
+                    arr.sort((a,b) => a[prop] - b[prop]); 
+                    const buckets = [];
+                    if (arr.length === 0) return buckets;
+                    let currentBucket = [arr[0]];
+                    buckets.push(currentBucket);
+                    for (let i = 1; i < arr.length; i++) {
+                        if (Math.abs(arr[i][prop] - arr[i-1][prop]) > EPSILON) {
+                            currentBucket = [arr[i]];
+                            buckets.push(currentBucket);
+                        } else {
+                            currentBucket.push(arr[i]);
+                        }
+                    }
+                    return buckets;
+                };
+
+                const grid = [];
+                const xBuckets = gapSort(items, 'x');
+                
+                if(xBuckets.length > nx) {
+                     xBuckets.sort((a,b) => b.length - a.length);
+                     const selected = xBuckets.slice(0, nx).sort((a,b) => a[0].x - b[0].x);
+                     xBuckets.length = 0; xBuckets.push(...selected);
+                }
+                
+                for(let i=0; i<nx; i++) {
+                    grid[i] = [];
+                    const xItems = xBuckets[i] || xBuckets[xBuckets.length-1]; 
+                    
+                    const yBuckets = gapSort(xItems, 'y');
+                    
+                    if(yBuckets.length > ny) {
+                         yBuckets.sort((a,b) => b.length - a.length);
+                         const selected = yBuckets.slice(0, ny).sort((a,b) => a[0].y - b[0].y);
+                         yBuckets.length = 0; yBuckets.push(...selected);
+                    }
+
+                    for(let j=0; j<ny; j++) {
+                        const yItems = yBuckets[j] || yBuckets[yBuckets.length-1]; 
+                        
+                        yItems.sort((a,b) => a.z - b.z);
+
+                        grid[i][j] = [];
+                        for(let k=0; k<nz; k++) {
+                            const item = yItems[k] || yItems[yItems.length-1]; 
+                            grid[i][j][k] = item.h;
+                        }
+                    }
+                }
+                return grid;
+            }
+
+            getStructuredHandles(mesh) {
+                if (mesh.userData.gridInfo && this.vertexMap.length > 0) {
+                    const segs = mesh.userData.segments;
+                    const nx = segs.x + 1, ny = segs.y + 1, nz = segs.z + 1;
+                    
+                    const grid = Array(nx).fill().map(() => Array(ny).fill().map(() => Array(nz).fill(null)));
+                    
+                    let dataCount = 0;
+                    
+                    this.handles.forEach((h, hIdx) => {
+                        const vIdx = this.vertexMap.indexOf(hIdx);
+                        if(vIdx !== -1 && mesh.userData.gridInfo[vIdx]) {
+                            const {x, y, z} = mesh.userData.gridInfo[vIdx];
+                            if(x < nx && y < ny && z < nz) {
+                                grid[x][y][z] = h;
+                                dataCount++;
+                            }
+                        }
+                    });
+
+                    if (dataCount > 0) return grid;
+                }
+                
+                this.cacheGridIndices(mesh);
+                return this.getStructuredHandles(mesh);
+            }
+			
+            exitEditMode() {
+                this.state.mode = 'object'; this.state.editTool = 'select'; 
+                this.resetKnifeTool(); this.orbit.enabled = true;
+                this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333));
+                this.state.multiSelection = [];
+                this.connectionLine.visible = false;
+                document.getElementById('action-container').classList.add('hidden');
+                
+                document.getElementById('tool-select').click();
+                this.clearHandles(); 
+                if(this.wireframeHelper) { this.state.selectedObj.remove(this.wireframeHelper); this.wireframeHelper = null; }

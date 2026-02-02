@@ -1,0 +1,504 @@
+
+
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>Jarvis 3D - Selección Estricta</title>
+    <style>
+        * { box-sizing: border-box; touch-action: none; user-select: none; -webkit-user-select: none; }
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: 'Segoe UI', sans-serif; color: #eee; }
+        #viewport { width: 100vw; height: 100vh; display: block; z-index: 0; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; }
+        .header { display: flex; justify-content: space-between; align-items: flex-start; pointer-events: none; width: 100%; }
+        .interactive { pointer-events: auto; }
+        .mode-switch { background: #111; border: 1px solid #555; border-radius: 6px; display: flex; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); margin-bottom: 10px; }
+        .mode-opt { padding: 10px 15px; font-size: 12px; font-weight: bold; color: #777; cursor: pointer; transition: all 0.2s; }
+        .mode-opt.active { background: #e67e22; color: white; }
+        .footer { display: flex; justify-content: center; pointer-events: none; padding-bottom: 20px; flex-direction: column; align-items: center; gap: 10px;}
+        .transform-bar { background: rgba(30,30,30,0.95); border: 1px solid #555; border-radius: 12px; padding: 8px; display: flex; gap: 8px; backdrop-filter: blur(4px); box-shadow: 0 4px 10px rgba(0,0,0,0.4); pointer-events: auto; }
+        button { background: #333; color: #ccc; border: 1px solid #444; padding: 12px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        button.active { background: #3498db; color: #fff; border-color: #2980b9; }
+        button.btn-green { background: #27ae60; color: white; }
+        button.btn-danger { background: #c0392b; color: white; }
+        button.btn-action { background: #f1c40f; color: #222; border: 1px solid #f39c12; font-weight: bold; box-shadow: 0 0 15px rgba(241, 196, 15, 0.6); transform: scale(1.1); }
+        button.btn-tool { font-size: 18px; padding: 10px 14px; } 
+        .btn-icon { padding: 10px 12px; font-size: 16px; }
+        #status { position: absolute; top: 15px; left: 50%; transform:translateX(-50%); font-size: 13px; color: #fff; text-shadow: 1px 1px 2px black; pointer-events: none; background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 20px; white-space: nowrap; border: 1px solid #444; transition: all 0.2s; }
+        .hidden { display: none !important; }
+        @keyframes popIn { from { transform: scale(0); opacity: 0; } to { transform: scale(1.1); opacity: 1; } }
+        .pop-in { animation: popIn 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+		.sub-mode-switch { background: #222; border: 1px solid #444; border-radius: 6px; display: flex; overflow: hidden; margin-top: 5px; }
+		.sub-opt { padding: 6px 12px; font-size: 16px; color: #777; cursor: pointer; transition: all 0.2s; border-right: 1px solid #333; }
+		.sub-opt:last-child { border-right: none; }
+		.sub-opt:hover { background: #333; }
+		.sub-opt.active { background: #3498db; color: white; }
+		
+    </style>
+</head>
+<body>
+    <div id="viewport"></div>
+    <div id="ui-layer">
+        <div id="status">Listo</div>
+        <div class="header">
+            <div id="side-panel" class="interactive">
+                <div class="mode-switch">
+                    <div id="btn-mode-obj" class="mode-opt active">OBJETO</div>
+                    <div id="btn-mode-edit" class="mode-opt">EDICIÓN</div>
+                </div>
+				<div id="sub-mode-bar" class="sub-mode-switch hidden">
+					<div id="sel-vertex" class="sub-opt active" title="Vértices">1 Punto</div>
+					<div id="sel-edge" class="sub-opt" title="Bordes">2 Borde</div>
+					<div id="sel-face" class="sub-opt" title="Caras">3 Cara</div>
+				</div>
+            </div>
+            <div style="display: flex; gap: 8px;" class="interactive">
+                <button id="btn-toggle-wire" class="btn-icon" style="background: #444;" title="Alternar Vista">👁️</button>
+                <div style="width:1px; background:#555; margin: 0 2px;"></div>
+                <button id="btn-add">＋ Cubo</button>
+                <button id="btn-export" class="btn-green">⬇ GLB</button>
+            </div>
+        </div>
+        
+        <div id="action-container" class="interactive hidden" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); pointer-events: none;">
+             <button id="btn-connect-action" class="btn-action pop-in" style="pointer-events: auto;">⚡ ACCIÓN</button>
+        </div>
+
+        <div class="footer">
+            <div class="transform-bar" id="transform-tools">
+                <button id="mode-translate" class="active">Mover</button>
+                <button id="mode-rotate">Rotar</button>
+                <button id="mode-scale">Escalar</button>
+                <div style="width:1px; background:#555; margin: 0 5px;"></div>
+                <button id="btn-delete" class="btn-danger">🗑</button>
+            </div>
+            <div class="transform-bar hidden" id="edit-tools-bar">
+                <button id="tool-select" class="active btn-tool">👆</button>
+                <button id="tool-cut" class="btn-tool" style="background:#d35400; color:white;">🔪</button>
+                <button id="tool-connect" class="btn-tool" style="background:#8e44ad; color:white;">🔗</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+        class App {
+            constructor() {
+                this.state = {
+                    mode: 'object', editTool: 'select', 
+                    knifeStep: 0, 
+                    isCutting: false, isTouching: false,
+                    selectedObj: null, pointerData: { x:0, y:0, time:0, isGizmoDragging: false },
+                    activeEdge: null, slideRuler: null, cutRatio: 0.0,
+                    cutOptions: [],
+                    dragStart: { x: 0, y: 0 },
+                    multiSelection: [],
+                    wireframeMode: 'clean',
+                    userEdges: [],
+					selectMode: 'vertex', 
+					selectedGroup: [],    
+					groupStartPos: [],    
+					dragGroupOffsets: [], 
+                };
+                this.objects = []; this.handles = []; this.vertexMap = [];
+				this.dummy = new THREE.Object3D(); 
+				this.faceHighlightHelper = null;   
+                this.wireframeHelper = null; 
+                this.edgeHighlightHelper = null; this.cutPreviewHelper = null;
+                this.connectionLine = null;
+
+                this.raycaster = new THREE.Raycaster();
+                this.raycaster.params.Line.threshold = 0.3; 
+
+                this.initScene();
+                this.initControls();
+                this.initInteraction();
+                this.initUI();
+                this.addCube();
+                this.renderer.setAnimationLoop(this.render.bind(this));
+            }
+
+            initScene() {
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x222222);
+                this.scene.add(new THREE.GridHelper(30, 30, 0x444444, 0x282828));
+                this.scene.add(new THREE.AmbientLight(0xffffff, 0.7)); 
+                const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+                dirLight.position.set(5, 10, 7);
+                this.scene.add(dirLight);
+
+                this.camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+                this.camera.position.set(5, 5, 5);
+                
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                document.getElementById('viewport').appendChild(this.renderer.domElement);
+
+                this.selectionGroup = new THREE.Group();
+                this.scene.add(this.selectionGroup);
+
+                const edgeMat = new THREE.LineBasicMaterial({ color: 0xffff00, depthTest: false, linewidth: 5 });
+                this.edgeHighlightHelper = new THREE.LineSegments(new THREE.BufferGeometry(), edgeMat);
+                this.edgeHighlightHelper.renderOrder = 9999;
+                this.scene.add(this.edgeHighlightHelper);
+
+                const cutMat = new THREE.LineBasicMaterial({ color: 0x00ff00, depthTest: false, transparent: false, linewidth: 3 });
+                this.cutPreviewHelper = new THREE.LineSegments(new THREE.BufferGeometry(), cutMat);
+                this.cutPreviewHelper.renderOrder = 9999;
+                this.scene.add(this.cutPreviewHelper);
+
+                const connMat = new THREE.LineBasicMaterial({ color: 0xffdd00, depthTest: false, linewidth: 3 });
+                this.connectionLine = new THREE.Line(new THREE.BufferGeometry(), connMat);
+                this.connectionLine.renderOrder = 9999;
+                this.connectionLine.visible = false;
+                this.scene.add(this.connectionLine);
+				
+				this.scene.add(this.dummy);
+				
+				const faceGeo = new THREE.BufferGeometry();
+				const faceMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.4, side: THREE.DoubleSide, depthTest: false });
+				this.faceHighlightHelper = new THREE.Mesh(faceGeo, faceMat);
+				this.faceHighlightHelper.renderOrder = 9998;
+				this.faceHighlightHelper.visible = false; 
+				this.scene.add(this.faceHighlightHelper);
+            }
+
+            initControls() {
+                this.orbit = new OrbitControls(this.camera, this.renderer.domElement);
+                this.orbit.enableDamping = true;
+                this.gizmo = new TransformControls(this.camera, this.renderer.domElement);
+                this.scene.add(this.gizmo);
+                
+                this.gizmo.addEventListener('dragging-changed', (e) => {
+				this.orbit.enabled = !e.value;
+				this.state.pointerData.isGizmoDragging = e.value;
+    
+				if (e.value && this.state.selectedGroup.length > 1) {
+				const center = this.dummy.position.clone();
+				this.state.dragGroupOffsets = this.state.selectedGroup.map(h => {
+				return new THREE.Vector3().subVectors(h.position, center);
+				});
+			}
+		});
+
+				this.gizmo.addEventListener('change', () => {
+					if (this.state.mode === 'edit' && this.state.selectedGroup.length > 1 && this.state.pointerData.isGizmoDragging) {
+						const currentDummyPos = this.dummy.position;
+						
+						this.state.selectedGroup.forEach((h, i) => {
+							if (this.state.dragGroupOffsets[i]) {
+								const offset = this.state.dragGroupOffsets[i];
+								const newPos = currentDummyPos.clone().add(offset);
+								h.position.copy(newPos);
+							}
+						});
+						this.updateGeometryFromHandles();
+					} 
+					else if (this.state.mode === 'edit' && this.state.selectedObj) {
+						this.updateGeometryFromHandles();
+					}
+				});
+            }
+
+            initInteraction() {
+                const canvas = this.renderer.domElement;
+                
+                canvas.addEventListener('pointerdown', (e) => {
+                    this.state.pointerData.x = e.clientX;
+                    this.state.pointerData.y = e.clientY;
+                    this.state.pointerData.time = Date.now();
+                    this.state.isTouching = true;
+
+                    if(this.state.mode === 'edit' && this.state.editTool === 'cut' && this.state.knifeStep === 1) {
+                        this.state.isCutting = true;
+                        this.state.dragStart = { x: e.clientX, y: e.clientY };
+                        this.updateKnifeVisuals(e, 'cut_start');
+                    }
+                });
+
+                canvas.addEventListener('pointermove', (e) => {
+                    if(this.state.mode === 'edit' && this.state.editTool === 'cut' && this.state.isTouching) {
+                        if (this.state.knifeStep === 0) {
+                            this.updateKnifeVisuals(e, 'search');
+                        }
+                        else if (this.state.isCutting) {
+                            this.updateKnifeVisuals(e, 'cut_move');
+                        }
+                    }
+                });
+
+                canvas.addEventListener('pointerup', (e) => {
+                    this.state.isTouching = false;
+                    if(this.state.pointerData.isGizmoDragging) return;
+                    const dist = Math.hypot(e.clientX - this.state.pointerData.x, e.clientY - this.state.pointerData.y);
+
+                    if (this.state.mode === 'edit' && this.state.editTool === 'cut') { 
+                        if (this.state.knifeStep === 0) {
+                            if (this.state.activeEdge) { 
+                                this.updateKnifeVisuals(e, 'select');
+                            }
+                        }
+                        else if (this.state.isCutting) {
+                            this.updateKnifeVisuals(e, 'apply');
+                            this.state.isCutting = false;
+                        }
+                        return; 
+                    }
+                    
+                    if(dist < 10 && (Date.now() - this.state.pointerData.time) < 300) this.handleTap(e.clientX, e.clientY);
+                });
+
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+            }
+
+            getPairId(id1, id2) {
+                return (id1 < id2) ? `${id1}_${id2}` : `${id2}_${id1}`;
+            }
+
+            syncUserEdgesToMesh() {
+                if(this.state.selectedObj) {
+                    this.state.selectedObj.userData.userEdges = [...this.state.userEdges];
+                }
+            }
+
+            addUserEdge(id1, id2) {
+                const pair = this.getPairId(id1, id2);
+                if (!this.state.userEdges.includes(pair)) {
+                    this.state.userEdges.push(pair);
+                    this.syncUserEdgesToMesh(); 
+                }
+            }
+
+            removeUserEdge(id1, id2) {
+                const pair = this.getPairId(id1, id2);
+                const idx = this.state.userEdges.indexOf(pair);
+                if (idx !== -1) {
+                    this.state.userEdges.splice(idx, 1);
+                    this.syncUserEdgesToMesh();
+                }
+            }
+
+            hasUserEdge(id1, id2) {
+                const pair = this.getPairId(id1, id2);
+                return this.state.userEdges.includes(pair);
+            }
+
+            toggleConnectSelection(handle) {
+                const idx = this.state.multiSelection.indexOf(handle);
+                if (idx > -1) {
+                    handle.children[0].material.color.setHex(0xff3333); 
+                    this.state.multiSelection.splice(idx, 1);
+                } else {
+                    if (this.state.multiSelection.length >= 2) {
+                        const old = this.state.multiSelection.shift();
+                        old.children[0].material.color.setHex(0xff3333);
+                    }
+                    handle.children[0].material.color.setHex(0x2ecc71);
+                    this.state.multiSelection.push(handle);
+                }
+
+                if (this.state.multiSelection.length === 2) {
+                    const h1 = this.state.multiSelection[0];
+                    const h2 = this.state.multiSelection[1];
+                    const id1 = this.handles.indexOf(h1);
+                    const id2 = this.handles.indexOf(h2);
+
+                    const exists = this.hasUserEdge(id1, id2);
+                    const btn = document.getElementById('btn-connect-action');
+                    
+                    if (exists) {
+                        btn.innerText = "⚡ DISOLVER";
+                        btn.style.background = "#e74c3c"; 
+                    } else {
+                        btn.innerText = "⚡ CONECTAR";
+                        btn.style.background = "#f1c40f"; 
+                    }
+
+                    const pts = [h1.position, h2.position];
+                    this.connectionLine.geometry.setFromPoints(pts);
+                    this.connectionLine.visible = true;
+                    document.getElementById('action-container').classList.remove('hidden');
+                } else {
+                    this.connectionLine.visible = false;
+                    document.getElementById('action-container').classList.add('hidden');
+                }
+            }
+
+            performConnection() {
+                if (this.state.multiSelection.length !== 2) return;
+                const mesh = this.state.selectedObj; if (!mesh) return;
+
+                const h1 = this.state.multiSelection[0];
+                const h2 = this.state.multiSelection[1];
+                const id1 = this.handles.indexOf(h1);
+                const id2 = this.handles.indexOf(h2);
+
+                if (this.hasUserEdge(id1, id2)) {
+                    this.removeUserEdge(id1, id2); 
+                    document.getElementById('status').innerText = "Línea Disuelta (Visual)";
+                } else {
+                    this.addUserEdge(id1, id2); 
+                    
+                    const vIndices1 = []; const vIndices2 = [];
+                    this.vertexMap.forEach((handleIdx, vIdx) => {
+                        if (handleIdx === id1) vIndices1.push(vIdx);
+                        if (handleIdx === id2) vIndices2.push(vIdx);
+                    });
+
+                    if (vIndices1.length > 0 && vIndices2.length > 0) {
+                        const indexAttr = mesh.geometry.index;
+                        const indices = indexAttr.array;
+                        const isG1 = (i) => vIndices1.includes(i);
+                        const isG2 = (i) => vIndices2.includes(i);
+                        
+                        let success = false;
+                        const trisP1 = [];
+                        for(let i=0; i<indices.length; i+=3) {
+                            if(isG1(indices[i]) || isG1(indices[i+1]) || isG1(indices[i+2])) trisP1.push(i);
+                        }
+
+                        const replaceInTri = (baseIdx, oldVal, newVal) => {
+                            if(indices[baseIdx] == oldVal) indices[baseIdx] = newVal;
+                            else if(indices[baseIdx+1] == oldVal) indices[baseIdx+1] = newVal;
+                            else if(indices[baseIdx+2] == oldVal) indices[baseIdx+2] = newVal;
+                        };
+
+                        for (let t1 of trisP1) {
+                            if(success) break;
+                            const vA = [indices[t1], indices[t1+1], indices[t1+2]];
+                            for(let t2=0; t2<indices.length; t2+=3) {
+                                if(t1 === t2) continue;
+                                const vB = [indices[t2], indices[t2+1], indices[t2+2]];
+                                const shared = vA.filter(v => vB.includes(v));
+                                if(shared.length === 2) {
+                                    const uniqueA = vA.find(v => !shared.includes(v));
+                                    const uniqueB = vB.find(v => !shared.includes(v));
+                                    const p1InShared = shared.some(v => isG1(v));
+                                    const p2InShared = shared.some(v => isG2(v));
+                                    
+                                    if(p1InShared && p2InShared) {
+                                        success = true; break; 
+                                    }
+
+                                    const isConnectCase = (isG1(uniqueA) && isG2(uniqueB)) || (isG1(uniqueB) && isG2(uniqueA));
+                                    if(isConnectCase) {
+                                        const s0 = shared[0]; const s1 = shared[1];
+                                        replaceInTri(t1, s1, uniqueB); replaceInTri(t2, s0, uniqueA);
+                                        success = true; document.getElementById('status').innerText = "Conexión Creada"; break;
+                                    }
+                                }
+                            }
+                        }
+                        if(success) { mesh.geometry.index.needsUpdate = true; mesh.geometry.computeVertexNormals(); }
+                    }
+                }
+
+                this.setupDirectWireframe(mesh);
+
+                this.state.multiSelection.forEach(h => h.children[0].material.color.setHex(0xff3333));
+                this.state.multiSelection = [];
+                this.connectionLine.visible = false;
+                document.getElementById('action-container').classList.add('hidden');
+            }
+
+            updateWireframeRealtime() {
+                const mesh = this.state.selectedObj; if(!mesh) return;
+                
+                if(this.wireframeHelper) { 
+                    mesh.remove(this.wireframeHelper); 
+                    if(this.wireframeHelper.geometry) this.wireframeHelper.geometry.dispose();
+                    this.wireframeHelper = null;
+                }
+                
+                let geometry;
+                if (this.state.wireframeMode === 'full') {
+                    geometry = new THREE.WireframeGeometry(mesh.geometry);
+                } else {
+                    const grid = this.getStructuredHandles(mesh);
+                    if (!grid) return;
+                    
+                    const segs = mesh.userData.segments;
+                    const nx = grid.length; 
+                    const ny = grid[0].length; 
+                    const nz = grid[0][0].length;
+                    const newPoints = [];
+
+                    const getPos = (i,j,k) => {
+                        const p = grid[i][j][k].position.clone();
+                        mesh.worldToLocal(p);
+                        return p;
+                    };
+
+                    for(let i=0; i<nx; i++) {
+                        for(let j=0; j<ny; j++) {
+                            for(let k=0; k<nz; k++) {
+                                const p = getPos(i,j,k);
+                                if (i < nx - 1) { const px = getPos(i+1, j, k); newPoints.push(p.x, p.y, p.z, px.x, px.y, px.z); }
+                                if (j < ny - 1) { const py = getPos(i, j+1, k); newPoints.push(p.x, p.y, p.z, py.x, py.y, py.z); }
+                                if (k < nz - 1) { const pz = getPos(i, j, k+1); newPoints.push(p.x, p.y, p.z, pz.x, pz.y, pz.z); }
+                            }
+                        }
+                    }
+
+                    this.state.userEdges.forEach(pairStr => {
+                        const parts = pairStr.split('_');
+                        const h1 = this.handles[parseInt(parts[0])];
+                        const h2 = this.handles[parseInt(parts[1])];
+                        if (h1 && h2) {
+                            const p1 = h1.position.clone(); mesh.worldToLocal(p1);
+                            const p2 = h2.position.clone(); mesh.worldToLocal(p2);
+                            newPoints.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+                        }
+                    });
+
+                    geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(newPoints, 3));
+                }
+
+                const mat = new THREE.LineBasicMaterial({ color: 0xffaa00, depthTest: false, opacity: 1, transparent: false });
+                this.wireframeHelper = new THREE.LineSegments(geometry, mat);
+                this.wireframeHelper.renderOrder = 999;
+                mesh.add(this.wireframeHelper);
+            }
+			
+			toggleWireframeMode() {
+				// Alternar entre modos
+				if (this.state.wireframeMode === 'clean') {
+				this.state.wireframeMode = 'full';
+				document.getElementById('status').innerText = "Vista: Alambre Completo";
+    } else {
+        this.state.wireframeMode = 'clean';
+        document.getElementById('status').innerText = "Vista: Limpia";
+    }
+    
+    // Forzar actualización visual
+    if (this.state.selectedObj) {
+        this.updateWireframeRealtime();
+    }
+}
+
+            updateKnifeVisuals(mouseEvent, phase) {
+                if(!this.state.selectedObj) return;
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                
+                const getScreenPos = (vec3) => {
+                    const v = vec3.clone().project(this.camera);
+                    return new THREE.Vector2(
+                        (v.x * .5 + .5) * rect.width + rect.left,
+                        -(v.y * .5 - .5) * rect.height + rect.top
+                    );
