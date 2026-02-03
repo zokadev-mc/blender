@@ -1,10 +1,6 @@
-# PARTE 2/3 - hytaleModdingTools.py
+# PARTE 2/4 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
-        
-        if valid_axes_2:
-            best_axis_2 = max(valid_axes_2, key=lambda a: n2_prime.dot(a))
-            rot2 = n2_prime.rotation_difference(best_axis_2)
         
     rot_total = rot2 @ rot1
     
@@ -504,3 +500,6 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         if not selected_meshes:
             self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
             return {'CANCELLED'}
+
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')

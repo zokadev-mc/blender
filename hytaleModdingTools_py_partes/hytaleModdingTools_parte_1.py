@@ -1,23 +1,15 @@
-# PARTE 1/3 - hytaleModdingTools.py
+# PARTE 1/4 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
 # fixed version of HytaleModelExporterPre.py
-# Changes:
-# - v0.33: "Safety Check" Popup on Export.
-# - v0.34: Compact JSON formatting.
-# - v0.35: Math fix logic.
-# - v0.36: Attempted bpy.ops (Context sensitive).
-# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
-#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
-#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
     "author": "Jarvis",
-    "version": (0, 37),
+    "version": (0, 38),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
+    "description": "Exportador v0.38",
     "category": "Import-Export",
 }
 
@@ -28,6 +20,9 @@ import re
 import os
 import math
 import bmesh
+import blf
+import gpu
+from gpu_extras.batch import batch_for_shader
 from bpy_extras.io_utils import ImportHelper
 
 # --- CONSTANTES ---
@@ -503,3 +498,7 @@ def reconstruct_orientation_from_geometry(obj):
         
         # Buscar el eje global más cercano que sea perpendicular a best_axis_1
         valid_axes_2 = [a for a in axes if abs(a.dot(best_axis_1)) < 0.01]
+        
+        if valid_axes_2:
+            best_axis_2 = max(valid_axes_2, key=lambda a: n2_prime.dot(a))
+            rot2 = n2_prime.rotation_difference(best_axis_2)
