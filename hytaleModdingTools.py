@@ -14,7 +14,7 @@ bl_info = {
     "version": (0, 38),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
+    "description": "Exportador v0.38",
     "category": "Import-Export",
 }
 
