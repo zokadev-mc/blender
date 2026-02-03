@@ -32,18 +32,18 @@ jobs:
           git config --global user.name "AutoSplit Bot"
           git config --global user.email "actions@github.com"
           
-          # Agregamos todos los cambios (las carpetas _partes generadas)
+          # Agregamos todos los archivos generados
           git add .
           
-          # Verificamos si realmente hay algo nuevo que subir
+          # Verificamos si hay cambios reales para evitar commits vacíos
           if ! git diff-index --quiet HEAD; then
             git commit -m "Auto-split: Actualización de partes de archivos"
             
-            # LA MEJORA: Trae cambios remotos y aplica los nuestros encima para evitar el error 'rejected'
+            # Sincronizamos con el remoto antes de subir
+            # Esto resuelve el error 'fetch first' aplicando tus cambios sobre los remotos
             git pull --rebase origin main
             
-            # Sube los cambios de forma segura
             git push origin main
           else
-            echo "No se detectaron cambios en las partes, nada que subir."
+            echo "No se detectaron cambios, nada que subir."
           fi
