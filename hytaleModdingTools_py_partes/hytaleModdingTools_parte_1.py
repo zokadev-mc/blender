@@ -4,15 +4,20 @@
 # fixed version of HytaleModelExporterPre.py
 # Changes:
 # - v0.33: "Safety Check" Popup on Export.
-#   If the validator detects ANY issues (warnings or errors), a confirmation popup appears asking to proceed or cancel.
+# - v0.34: Compact JSON formatting.
+# - v0.35: Math fix logic.
+# - v0.36: Attempted bpy.ops (Context sensitive).
+# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
+#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
+#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
     "author": "Jarvis",
-    "version": (0, 33),
+    "version": (0, 37),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.33 (Aviso de seguridad antes de exportar si hay errores).",
+    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
     "category": "Import-Export",
 }
 
@@ -312,8 +317,11 @@ def extract_uvs(obj, output_w, output_h, snap_to_pixels):
     return uv_layout
 
 def process_node(obj, out_w, out_h, snap_uvs, id_counter):
-    loc = obj.location
-    rot = obj.rotation_quaternion if obj.rotation_mode == 'QUATERNION' else obj.rotation_euler.to_quaternion()
+    # --- PROCESO TRAS APLICAR INVERSO ---
+    # Gracias a la matemática aplicada en la colección temporal, 
+    # obj.matrix_local ya contiene la transformación relativa limpia.
+    
+    loc, rot, sca = obj.matrix_local.decompose()
     
     local_center = mathutils.Vector((0,0,0))
     final_dims = mathutils.Vector((0,0,0))
@@ -324,9 +332,10 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
         min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
         max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
         
-        scale = obj.scale
-        real_min = mathutils.Vector((min_v.x * scale.x, min_v.y * scale.y, min_v.z * scale.z))
-        real_max = mathutils.Vector((max_v.x * scale.x, max_v.y * scale.y, max_v.z * scale.z))
+        # Para la geometría (Bounds), seguimos usando la escala del bloque de datos
+        scale_data = obj.scale 
+        real_min = mathutils.Vector((min_v.x * scale_data.x, min_v.y * scale_data.y, min_v.z * scale_data.z))
+        real_max = mathutils.Vector((max_v.x * scale_data.x, max_v.y * scale_data.y, max_v.z * scale_data.z))
         
         local_center = (real_min + real_max) / 2.0
         final_dims = mathutils.Vector((abs(real_max.x - real_min.x), abs(real_max.y - real_min.y), abs(real_max.z - real_min.z)))
@@ -339,8 +348,8 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     node_data = {
         "id": str(id_counter[0]),
         "name": final_name,
-        "position": blender_to_hytale_pos(loc),
-        "orientation": blender_to_hytale_quat(rot),
+        "position": blender_to_hytale_pos(loc),      
+        "orientation": blender_to_hytale_quat(rot),  
         "children": [],
         "shape": {"type": "none"} 
     }
@@ -423,7 +432,7 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     if not node_data["children"]:
         del node_data["children"]
     # ---------------------------------------------------
-
+    
     return node_data
 
 # ==========================================
@@ -494,27 +503,3 @@ def reconstruct_orientation_from_geometry(obj):
         
         # Buscar el eje global más cercano que sea perpendicular a best_axis_1
         valid_axes_2 = [a for a in axes if abs(a.dot(best_axis_1)) < 0.01]
-        
-        if valid_axes_2:
-            best_axis_2 = max(valid_axes_2, key=lambda a: n2_prime.dot(a))
-            rot2 = n2_prime.rotation_difference(best_axis_2)
-        
-    rot_total = rot2 @ rot1
-    
-    if abs(rot_total.angle) < 0.001:
-        bm.free()
-        return
-
-    # Aplicar la rotación inversa a la geometría (enderezar malla)
-    bmesh.ops.rotate(bm, verts=bm.verts, cent=mathutils.Vector((0,0,0)), matrix=rot_total.to_matrix())
-    
-    # Aplicar la rotación al objeto (compensar visualmente)
-    rotation_to_apply = rot_total.inverted()
-    
-    obj.rotation_mode = 'QUATERNION'
-    obj.rotation_quaternion = obj.rotation_quaternion @ rotation_to_apply
-    
-    bm.to_mesh(mesh)
-    bm.free()
-    obj.data.update()
-

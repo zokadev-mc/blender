@@ -1,24 +1,49 @@
 # PARTE 2/3 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+        
+        if valid_axes_2:
+            best_axis_2 = max(valid_axes_2, key=lambda a: n2_prime.dot(a))
+            rot2 = n2_prime.rotation_difference(best_axis_2)
+        
+    rot_total = rot2 @ rot1
+    
+    if abs(rot_total.angle) < 0.001:
+        bm.free()
+        return
+
+    # Aplicar la rotación inversa a la geometría (enderezar malla)
+    bmesh.ops.rotate(bm, verts=bm.verts, cent=mathutils.Vector((0,0,0)), matrix=rot_total.to_matrix())
+    
+    # Aplicar la rotación al objeto (compensar visualmente)
+    rotation_to_apply = rot_total.inverted()
+    
+    obj.rotation_mode = 'QUATERNION'
+    obj.rotation_quaternion = obj.rotation_quaternion @ rotation_to_apply
+    
+    bm.to_mesh(mesh)
+    bm.free()
+    obj.data.update()
+
 def process_and_decompose_collection(source_col, temp_col):
     processed_roots = []
     old_to_new = {}
     
+    # 1. Copiar objetos a la colección temporal
     for obj in source_col.objects:
         new_obj = obj.copy()
         new_obj.data = obj.data.copy() if obj.data else None
         temp_col.objects.link(new_obj)
         old_to_new[obj] = new_obj
         
+    # 2. Restaurar parentesco
     for old_obj, new_obj in old_to_new.items():
         if old_obj.parent and old_obj.parent in old_to_new:
             new_obj.parent = old_to_new[old_obj.parent]
         else:
             processed_roots.append(new_obj)
 
-    # --- CAMBIO AÑADIDO: AISLAMIENTO INTELIGENTE DE HERMANOS ---
-    # Detectar padres que tienen múltiples hijos Mesh y crear wrappers "GRP_"
+    # 3. Wrapper inteligente para hermanos (Fix Jerarquías múltiples)
     parent_map = {}
     for obj in temp_col.objects:
         if obj.parent and obj.type == 'MESH':
@@ -42,9 +67,25 @@ def process_and_decompose_collection(source_col, temp_col):
                 saved_matrix_local = child.matrix_local.copy()
                 child.parent = wrapper
                 child.matrix_local = saved_matrix_local
-    # ---------------------------------------------------------------------
 
-    final_objects_to_check = list(old_to_new.values())
+    # --- CAMBIO V0.37: MATRIZ MATEMÁTICA (APPLY PARENT INVERSE) ---
+    # En lugar de usar bpy.ops (que falla si no hay contexto visual),
+    # calculamos directamente la matriz resultante.
+    # Fórmula equivalente a Ctrl+A > Parent Inverse:
+    # 1. Nueva Local = MatrizParentInverse * Vieja Local
+    # 2. Reset MatrizParentInverse a Identidad
+    
+    for obj in temp_col.objects:
+        if obj.parent:
+            # "Quemamos" la relación visual en la transformación local
+            obj.matrix_local = obj.matrix_parent_inverse @ obj.matrix_local
+            # Reseteamos la inversa (limpieza)
+            obj.matrix_parent_inverse.identity()
+    # --------------------------------------------------------------
+
+    # 4. Procesar geometrías (Separa loose parts y arregla rotaciones)
+    final_objects_to_check = [o for o in temp_col.objects if o.type == 'MESH'] # Lista segura
+    
     bpy.ops.object.select_all(action='DESELECT')
     
     for obj in final_objects_to_check:
@@ -57,6 +98,7 @@ def process_and_decompose_collection(source_col, temp_col):
             
             separated_parts = bpy.context.selected_objects
             
+            # Si se separó en partes, actualizar la lista de raíces si es necesario
             if len(separated_parts) > 1 and obj in processed_roots:
                 processed_roots.remove(obj)
                 for part in separated_parts:
@@ -370,14 +412,18 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            # --- BLOQUE NUEVO (Compacto Fijo) ---
-            import re # Aseguramos disponibilidad
-
-            # 1. Generamos JSON con indentación ligera (2 espacios ahorran mucho texto)
-            json_str = json.dumps(final_json, indent=2)
+            # --- BLOQUE OPTIMIZADO: Formato Compacto ---
+            # 1. Generamos JSON con indentación vertical limpia
+            json_str = json.dumps(final_json, indent=1)
             
             # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
-            # Busca patrones verticales y los aplasta horizontalmente
+            # Convierte:
+            # {
+            #  "x": 10,
+            #  "y": 5,
+            #  "z": 0
+            # }
+            # a: {"x": 10, "y": 5, "z": 0}
             json_str = re.sub(
                 r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
                 r'{"x": \1, "y": \2, "z": \3}', 
@@ -393,7 +439,7 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 flags=re.DOTALL
             )
             
-            # 4. Escritura y Reporte de Peso
+            # 4. Escritura
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
                 
@@ -458,146 +504,3 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         if not selected_meshes:
             self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
             return {'CANCELLED'}
-
-        if context.object and context.object.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        context.view_layer.objects.active = selected_meshes[0]
-        bpy.ops.object.join()
-        main_obj = context.active_object
-        
-        # 1. Reconstrucción de orientación para cálculos precisos (también usa el FIX)
-        reconstruct_orientation_from_geometry(main_obj)
-        
-        props = context.scene.hytale_props
-        tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 64, 64 
-
-        bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(main_obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
-        
-        # --- PASO 1: UNWRAP ---
-        bpy.ops.mesh.select_all(action='SELECT')
-        if props.new_unwrap:
-            try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001, correct_aspect=True)
-            except:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-
-        # --- PASO 2: ALINEACIÓN (API Moderna) ---
-        area_uv = next((a for a in context.screen.areas if a.type == 'IMAGE_EDITOR'), None)
-        if area_uv:
-            with context.temp_override(area=area_uv):
-                try: 
-                    bpy.ops.uv.select_all(action='SELECT')
-                    bpy.ops.uv.align_rotation(method='AUTO', correct_aspect=True)
-                except: pass
-        
-        bmesh.update_edit_mesh(main_obj.data)
-
-        # --- PASO 3: ESCALADO PIXEL PERFECT ---
-        all_loops = [l for f in bm.faces for l in f.loops]
-        if not all_loops:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            return {'FINISHED'}
-
-        min_u_global = min(l[uv_layer].uv.x for l in all_loops)
-        max_u_global = max(l[uv_layer].uv.x for l in all_loops)
-        min_v_global = min(l[uv_layer].uv.y for l in all_loops)
-        max_v_global = max(l[uv_layer].uv.y for l in all_loops)
-
-        dominant_face = max(bm.faces, key=lambda f: f.calc_area())
-        v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = mathutils.Vector(((v1.x-v0.x)*main_obj.scale.x, (v1.y-v0.y)*main_obj.scale.y, (v1.z-v0.z)*main_obj.scale.z)).length
-        h_3d = mathutils.Vector(((v3.x-v0.x)*main_obj.scale.x, (v3.y-v0.y)*main_obj.scale.y, (v3.z-v0.z)*main_obj.scale.z)).length
-
-        uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
-        curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
-        curr_h_uv = max(0.0001, max(u.y for u in uvs_dom) - min(u.y for u in uvs_dom))
-
-        scale_u = (w_3d * 16.0 / tex_w) / curr_w_uv
-        scale_v = (h_3d * 16.0 / tex_h) / curr_h_uv
-
-        pivot = mathutils.Vector(((min_u_global + max_u_global) / 2.0, (min_v_global + max_v_global) / 2.0))
-        for f in bm.faces:
-            for l in f.loops:
-                l[uv_layer].uv.x = pivot.x + (l[uv_layer].uv.x - pivot.x) * scale_u
-                l[uv_layer].uv.y = pivot.y + (l[uv_layer].uv.y - pivot.y) * scale_v
-                if props.snap_uvs:
-                    l[uv_layer].uv.x = round(l[uv_layer].uv.x * tex_w) / tex_w
-                    l[uv_layer].uv.y = round(l[uv_layer].uv.y * tex_h) / tex_h
-
-        bmesh.update_edit_mesh(main_obj.data)
-
-        # --- PASO 4: AUTO-STACK POR INTERSECCIÓN (OPCIONAL) ---
-        if props.auto_stack:
-            # Funciones internas para detectar islas y dimensiones
-            def get_islands(bm, uv_layer):
-                all_faces = set(bm.faces)
-                islands = []
-                while all_faces:
-                    face = all_faces.pop()
-                    island = {face}
-                    stack = [face]
-                    while stack:
-                        f = stack.pop()
-                        for edge in f.edges:
-                            for neighbor in edge.link_faces:
-                                if neighbor in all_faces:
-                                    is_joined = False
-                                    for l1 in f.loops:
-                                        if l1.edge == edge:
-                                            for l2 in neighbor.loops:
-                                                if l2.edge == edge:
-                                                    if (l1[uv_layer].uv - l2[uv_layer].uv).length < 0.0001:
-                                                        is_joined = True; break
-                                    if is_joined:
-                                        island.add(neighbor); stack.append(neighbor); all_faces.remove(neighbor)
-                    islands.append(island)
-                return islands
-
-            def get_island_stats(island, uv_layer):
-                uvs = [l[uv_layer].uv for f in island for l in f.loops]
-                mi_u = min(u.x for u in uvs); ma_u = max(u.x for u in uvs)
-                mi_v = min(u.y for u in uvs); ma_v = max(u.y for u in uvs)
-                return {
-                    'min_u': mi_u, 'max_u': ma_u, 'min_v': mi_v, 'max_v': ma_v,
-                    'w': round(ma_u - mi_u, 5), 'h': round(ma_v - mi_v, 5),
-                    'min_corner': mathutils.Vector((mi_u, mi_v))
-                }
-
-            bm.faces.ensure_lookup_table()
-            islands = get_islands(bm, uv_layer)
-            stats = [get_island_stats(isl, uv_layer) for isl in islands]
-            
-            for i in range(len(stats)):
-                for j in range(i + 1, len(stats)):
-                    A = stats[i]
-                    B = stats[j]
-                    
-                    # Detección de colisión AABB
-                    overlap = not (A['max_u'] < B['min_u'] or A['min_u'] > B['max_u'] or 
-                                   A['max_v'] < B['min_v'] or A['min_v'] > B['max_v'])
-                    
-                    if overlap:
-                        if abs(A['w'] - B['w']) < 0.001 and abs(A['h'] - B['h']) < 0.001:
-                            diff = A['min_corner'] - B['min_corner']
-                            for f in islands[j]:
-                                for l in f.loops:
-                                    l[uv_layer].uv += diff
-                            
-                            B['min_corner'] += diff
-                            B['min_u'] += diff.x; B['max_u'] += diff.x
-                            B['min_v'] += diff.y; B['max_v'] += diff.y
-
-        # --- AJUSTE AL LIENZO ---
-        bmesh.update_edit_mesh(main_obj.data); curu, curv = [l[uv_layer].uv.x for f in bm.faces for l in f.loops], [l[uv_layer].uv.y for f in bm.faces for l in f.loops]
-        offu, offv = -min(curu) if min(curu) < 0 else (1.0 - max(curu) if max(curu) > 1.0 else 0), -min(curv) if min(curv) < 0 else (1.0 - max(curv) if max(curv) > 1.0 else 0)
-        if offu != 0.0 or offv != 0.0:
-            for face in bm.faces:
-                for loop in face.loops: loop[uv_layer].uv.x += offu; loop[uv_layer].uv.y += offv
-        bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
-        self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
-
-
