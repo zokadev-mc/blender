@@ -1,15 +1,20 @@
 # fixed version of HytaleModelExporterPre.py
 # Changes:
 # - v0.33: "Safety Check" Popup on Export.
-#   If the validator detects ANY issues (warnings or errors), a confirmation popup appears asking to proceed or cancel.
+# - v0.34: Compact JSON formatting.
+# - v0.35: Math fix logic.
+# - v0.36: Attempted bpy.ops (Context sensitive).
+# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
+#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
+#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
     "author": "Jarvis",
-    "version": (0, 33),
+    "version": (0, 37),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.33 (Aviso de seguridad antes de exportar si hay errores).",
+    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
     "category": "Import-Export",
 }
 
@@ -309,8 +314,11 @@ def extract_uvs(obj, output_w, output_h, snap_to_pixels):
     return uv_layout
 
 def process_node(obj, out_w, out_h, snap_uvs, id_counter):
-    loc = obj.location
-    rot = obj.rotation_quaternion if obj.rotation_mode == 'QUATERNION' else obj.rotation_euler.to_quaternion()
+    # --- PROCESO TRAS APLICAR INVERSO ---
+    # Gracias a la matemática aplicada en la colección temporal, 
+    # obj.matrix_local ya contiene la transformación relativa limpia.
+    
+    loc, rot, sca = obj.matrix_local.decompose()
     
     local_center = mathutils.Vector((0,0,0))
     final_dims = mathutils.Vector((0,0,0))
@@ -321,9 +329,10 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
         min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
         max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
         
-        scale = obj.scale
-        real_min = mathutils.Vector((min_v.x * scale.x, min_v.y * scale.y, min_v.z * scale.z))
-        real_max = mathutils.Vector((max_v.x * scale.x, max_v.y * scale.y, max_v.z * scale.z))
+        # Para la geometría (Bounds), seguimos usando la escala del bloque de datos
+        scale_data = obj.scale 
+        real_min = mathutils.Vector((min_v.x * scale_data.x, min_v.y * scale_data.y, min_v.z * scale_data.z))
+        real_max = mathutils.Vector((max_v.x * scale_data.x, max_v.y * scale_data.y, max_v.z * scale_data.z))
         
         local_center = (real_min + real_max) / 2.0
         final_dims = mathutils.Vector((abs(real_max.x - real_min.x), abs(real_max.y - real_min.y), abs(real_max.z - real_min.z)))
@@ -336,8 +345,8 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     node_data = {
         "id": str(id_counter[0]),
         "name": final_name,
-        "position": blender_to_hytale_pos(loc),
-        "orientation": blender_to_hytale_quat(rot),
+        "position": blender_to_hytale_pos(loc),      
+        "orientation": blender_to_hytale_quat(rot),  
         "children": [],
         "shape": {"type": "none"} 
     }
@@ -420,7 +429,7 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     if not node_data["children"]:
         del node_data["children"]
     # ---------------------------------------------------
-
+    
     return node_data
 
 # ==========================================
@@ -519,20 +528,21 @@ def process_and_decompose_collection(source_col, temp_col):
     processed_roots = []
     old_to_new = {}
     
+    # 1. Copiar objetos a la colección temporal
     for obj in source_col.objects:
         new_obj = obj.copy()
         new_obj.data = obj.data.copy() if obj.data else None
         temp_col.objects.link(new_obj)
         old_to_new[obj] = new_obj
         
+    # 2. Restaurar parentesco
     for old_obj, new_obj in old_to_new.items():
         if old_obj.parent and old_obj.parent in old_to_new:
             new_obj.parent = old_to_new[old_obj.parent]
         else:
             processed_roots.append(new_obj)
 
-    # --- CAMBIO AÑADIDO: AISLAMIENTO INTELIGENTE DE HERMANOS ---
-    # Detectar padres que tienen múltiples hijos Mesh y crear wrappers "GRP_"
+    # 3. Wrapper inteligente para hermanos (Fix Jerarquías múltiples)
     parent_map = {}
     for obj in temp_col.objects:
         if obj.parent and obj.type == 'MESH':
@@ -556,9 +566,25 @@ def process_and_decompose_collection(source_col, temp_col):
                 saved_matrix_local = child.matrix_local.copy()
                 child.parent = wrapper
                 child.matrix_local = saved_matrix_local
-    # ---------------------------------------------------------------------
 
-    final_objects_to_check = list(old_to_new.values())
+    # --- CAMBIO V0.37: MATRIZ MATEMÁTICA (APPLY PARENT INVERSE) ---
+    # En lugar de usar bpy.ops (que falla si no hay contexto visual),
+    # calculamos directamente la matriz resultante.
+    # Fórmula equivalente a Ctrl+A > Parent Inverse:
+    # 1. Nueva Local = MatrizParentInverse * Vieja Local
+    # 2. Reset MatrizParentInverse a Identidad
+    
+    for obj in temp_col.objects:
+        if obj.parent:
+            # "Quemamos" la relación visual en la transformación local
+            obj.matrix_local = obj.matrix_parent_inverse @ obj.matrix_local
+            # Reseteamos la inversa (limpieza)
+            obj.matrix_parent_inverse.identity()
+    # --------------------------------------------------------------
+
+    # 4. Procesar geometrías (Separa loose parts y arregla rotaciones)
+    final_objects_to_check = [o for o in temp_col.objects if o.type == 'MESH'] # Lista segura
+    
     bpy.ops.object.select_all(action='DESELECT')
     
     for obj in final_objects_to_check:
@@ -571,6 +597,7 @@ def process_and_decompose_collection(source_col, temp_col):
             
             separated_parts = bpy.context.selected_objects
             
+            # Si se separó en partes, actualizar la lista de raíces si es necesario
             if len(separated_parts) > 1 and obj in processed_roots:
                 processed_roots.remove(obj)
                 for part in separated_parts:
@@ -884,14 +911,18 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            # --- BLOQUE NUEVO (Compacto Fijo) ---
-            import re # Aseguramos disponibilidad
-
-            # 1. Generamos JSON con indentación ligera (2 espacios ahorran mucho texto)
-            json_str = json.dumps(final_json, indent=2)
+            # --- BLOQUE OPTIMIZADO: Formato Compacto ---
+            # 1. Generamos JSON con indentación vertical limpia
+            json_str = json.dumps(final_json, indent=1)
             
             # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
-            # Busca patrones verticales y los aplasta horizontalmente
+            # Convierte:
+            # {
+            #  "x": 10,
+            #  "y": 5,
+            #  "z": 0
+            # }
+            # a: {"x": 10, "y": 5, "z": 0}
             json_str = re.sub(
                 r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
                 r'{"x": \1, "y": \2, "z": \3}', 
@@ -907,7 +938,7 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 flags=re.DOTALL
             )
             
-            # 4. Escritura y Reporte de Peso
+            # 4. Escritura
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
                 
@@ -1239,7 +1270,7 @@ class HytaleProperties(bpy.types.PropertyGroup):
     selected_reference: bpy.props.EnumProperty(name="Referencia", items=get_templates_list)
 
 class PT_HytalePanel(bpy.types.Panel):
-    bl_label = "Hytale Tools v0.3"
+    bl_label = "Hytale Tools v0.37"
     bl_idname = "VIEW3D_PT_hytale_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
