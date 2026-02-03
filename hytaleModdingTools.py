@@ -1,12 +1,4 @@
 # fixed version of HytaleModelExporterPre.py
-# Changes:
-# - v0.33: "Safety Check" Popup on Export.
-# - v0.34: Compact JSON formatting.
-# - v0.35: Math fix logic.
-# - v0.36: Attempted bpy.ops (Context sensitive).
-# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
-#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
-#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
