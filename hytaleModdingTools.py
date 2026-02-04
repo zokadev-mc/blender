@@ -1,4 +1,12 @@
 # fixed version of HytaleModelExporterPre.py
+# Changes:
+# - v0.33: "Safety Check" Popup on Export.
+# - v0.34: Compact JSON formatting.
+# - v0.35: Math fix logic.
+# - v0.36: Attempted bpy.ops (Context sensitive).
+# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
+#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
+#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
@@ -6,7 +14,7 @@ bl_info = {
     "version": (0, 38),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.38",
+    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
     "category": "Import-Export",
 }
 
@@ -43,33 +51,87 @@ def get_image_size_from_objects(objects):
 
 def update_hytale_grid_setup(self, context):
     """
-    Configura el entorno base:
-    ON: Unidades 'NONE', Escala 2.0, Subdivisiones 32.
-    OFF: Unidades 'METRIC', Escala 1.0, Subdivisiones 10.
+    Configura el entorno Hytale usando la API descubierta (space.uv_editor).
     """
+    # 1. Ajuste de Unidades (Global)
     if self.setup_pixel_grid:
-        # 1. Configurar Unidades
         context.scene.unit_settings.system = 'NONE'
-        
-        # 2. Aplicar Escala 2.0 y Subdivisiones 32 a los visores
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        space.overlay.grid_scale = 1
-                        space.overlay.grid_subdivisions = 16
-                        space.overlay.show_floor = True
     else:
-        # RESET: Volver a valores por defecto de Blender
         context.scene.unit_settings.system = 'METRIC'
-        self.show_subdivisions = False # Desactivar el sub-checkbox
-        
-        for area in context.screen.areas:
+        self.show_subdivisions = False
+
+    # 2. Configurar VIEW_3D (Grid del suelo)
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
             if area.type == 'VIEW_3D':
                 for space in area.spaces:
                     if space.type == 'VIEW_3D':
-                        space.overlay.grid_scale = 1.0
-                        space.overlay.grid_subdivisions = 10
+                        if self.setup_pixel_grid:
+                            space.overlay.grid_scale = 1
+                            space.overlay.grid_subdivisions = 16
+                            space.overlay.show_floor = True
+                        else:
+                            space.overlay.grid_scale = 1.0
+                            space.overlay.grid_subdivisions = 10
+
+    # 3. [CORREGIDO] Configurar UV EDITOR con la API 'space.uv_editor'
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            # Buscamos por ui_type='UV' para dar con el editor correcto
+            if area.ui_type == 'UV': 
+                area.tag_redraw()
+                for space in area.spaces:
+                    if space.type == 'IMAGE_EDITOR':
+                        # Verificamos si existe el sub-objeto que encontraste en el log
+                        if hasattr(space, 'uv_editor'):
+                            uv_settings = space.uv_editor
+                            
+                            if self.setup_pixel_grid:
+                                # --- ACTIVAR MODO PIXEL PERFECT ---
+                                
+                                # 1. Ver las caras (malla rellena)
+                                uv_settings.show_faces = True 
+                                
+                                # 2. Activar la rejilla sobre la imagen
+                                uv_settings.show_grid_over_image = True
+                                
+                                
+                                # 3. Configurar la fuente de la rejilla a PIXELES
+                                # (Esto sustituye al antiguo show_pixel_grid)
+                                try:
+                                    uv_settings.grid_shape_source = 'PIXEL'
+                                except Exception:
+                                    # Si 'PIXEL' falla, probamos 'DYNAMIC' o lo dejamos estar
+                                    pass
+                                
+                                # 4. Desactivar distorsión
+                                uv_settings.show_stretch = False
+                                
+                            else:
+                                # --- DESACTIVAR ---
+                                uv_settings.show_grid_over_image = False
+                                # Opcional: apagar caras
+                                # uv_settings.show_faces = False
+                                
+                        if hasattr(space, 'overlay'):
+                            uv_settings2 = space.overlay
+
+                            if self.setup_pixel_grid:
+                                # --- ACTIVAR MODO PIXEL PERFECT ---
+                                try:
+                                    # 1. Ver las caras (malla rellena)
+                                    uv_settings2.show_overlays = True 
+                                
+                                    # 2. Activar la rejilla sobre la imagen
+                                    uv_settings2.show_grid_background = True
+                                
+                                except Exception:
+                                    pass
+                                
+                            else:
+                                # --- DESACTIVAR ---
+                                uv_settings2.show_grid_background = False
+                                uv_settings.show_grid_over_image = False
 
 def update_grid_subdivisions(self, context):
     """Lógica relativa: Divide o multiplica la escala actual por 16"""
@@ -610,9 +672,10 @@ def process_and_decompose_collection(source_col, temp_col):
 # ==========================================
 
 def hytale_to_blender_pos(h_pos):
-    x = h_pos.get("x", 0) / FIXED_GLOBAL_SCALE
-    y = -h_pos.get("z", 0) / FIXED_GLOBAL_SCALE
-    z = h_pos.get("y", 0) / FIXED_GLOBAL_SCALE
+    # Usamos tu factor de escala 16.0
+    x = h_pos.get("x", 0) / 16.0
+    y = -h_pos.get("z", 0) / 16.0
+    z = h_pos.get("y", 0) / 16.0
     return mathutils.Vector((x, y, z))
 
 def hytale_to_blender_quat(h_quat):
@@ -686,51 +749,80 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     face.loops[1][uv_layer].uv = uv_coords[2] 
     face.loops[0][uv_layer].uv = uv_coords[3] 
 
+# ### NUEVO: Se añade el argumento 'stretch' para deformar la malla
 def create_mesh_box_import(name, shape_data, texture_width, texture_height):
     settings = shape_data.get("settings", {})
     size = settings.get("size", {})
     hx, hy, hz = size.get("x", 0), size.get("y", 0), size.get("z", 0)
-    dx, dy, dz = hx/32.0, hz/32.0, hy/32.0
+    
+    # 1. Dimensiones Base
+    dx, dy, dz = (hx / 16.0)/2.0, (hz / 16.0)/2.0, (hy / 16.0)/2.0
     
     bm = bmesh.new()
+    # Vértices (X, -Z, Y en Blender para mapear Hytale)
+    # 0: BL-Front, 1: BR-Front, 2: BR-Back, 3: BL-Back (Inferiores)
+    # 4: TL-Front, 5: TR-Front, 6: TR-Back, 7: TL-Back (Superiores)
     v = [bm.verts.new((-dx, -dy, -dz)), bm.verts.new((dx, -dy, -dz)),
          bm.verts.new((dx, dy, -dz)), bm.verts.new((-dx, dy, -dz)),
          bm.verts.new((-dx, -dy, dz)), bm.verts.new((dx, -dy, dz)),
          bm.verts.new((dx, dy, dz)), bm.verts.new((-dx, dy, dz))]
     
+    # --- CORRECCIÓN DE WINDING (Normales Manuales) ---
+    # Definimos los vértices en sentido anti-horario (CCW) mirando desde fuera.
+    # Esto garantiza que las normales sean correctas sin usar recalc_normals.
     face_map = {
-        "top":    (v[4], v[5], v[6], v[7]), "bottom": (v[0], v[1], v[2], v[3]),
-        "front":  (v[0], v[1], v[5], v[4]), "back":   (v[2], v[3], v[7], v[6]),
-        "left":   (v[3], v[0], v[4], v[7]), "right":  (v[1], v[2], v[6], v[5])
+        "top":    (v[4], v[5], v[6], v[7]), # Correcto (+Z)
+        "bottom": (v[0], v[3], v[2], v[1]), # CORREGIDO: (Antes era 0,1,2,3 -> Invertido). Ahora (-Z)
+        "front":  (v[0], v[1], v[5], v[4]), # Correcto (-Y)
+        "back":   (v[2], v[3], v[7], v[6]), # Correcto (+Y)
+        "left":   (v[3], v[0], v[4], v[7]), # Correcto (-X)
+        "right":  (v[1], v[2], v[6], v[5])  # Correcto (+X)
     }
 
     tex_layout = shape_data.get("textureLayout", {})
     for f_name, f_verts in face_map.items():
         if f_name in tex_layout:
             try:
+                # Al crear la cara con el orden correcto, los índices de loops [0,1,2,3]
+                # son estables y predecibles para la función apply_uvs_smart.
                 f = bm.faces.new(f_verts)
+                
+                # Asignar dimensiones UV
                 if f_name in ['top', 'bottom']: fw, fh = hx, hz
                 elif f_name in ['front', 'back']: fw, fh = hx, hy
                 else: fw, fh = hz, hy
+                
                 apply_uvs_smart(f, bm, tex_layout[f_name], texture_width, texture_height, fw, fh)
-            except: pass
+            except ValueError:
+                pass # Evita error si la cara ya existe (raro en cubos)
+            except Exception:
+                pass
 
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    # --- IMPORTANTE: ELIMINADO recalc_face_normals ---
+    # Al quitar esto, evitamos que Blender decida invertir caras arbitrariamente,
+    # lo cual causaba que las UVs se rotaran 180 grados o se desapilaran.
+    # bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
     mesh = bpy.data.meshes.new(name)
     bm.to_mesh(mesh)
     bm.free()
     
+    # Aplicar offset
     obj_off = hytale_to_blender_pos(shape_data.get("offset", {}))
     for vert in mesh.vertices: vert.co += obj_off
     return mesh
-
+    
 def create_mesh_quad_import(name, shape_data, texture_width, texture_height):
     settings = shape_data.get("settings", {})
     size = settings.get("size", {})
     n = settings.get("normal", "+Y")
-    dx, dy = size.get('x', 16)/32.0, size.get('y', 16)/32.0
+    
+    # Tamaño base 1:1 con el archivo
+    dx = (size.get('x', 16) / 16.0) / 2.0
+    dy = (size.get('y', 16) / 16.0) / 2.0
+    
     bm = bmesh.new()
-
+    v_pos = []
     if n == "+Y": v_pos = [(-dx, -dy, 0), (dx, -dy, 0), (dx, dy, 0), (-dx, dy, 0)]
     elif n == "-Y": v_pos = [(-dx, dy, 0), (dx, dy, 0), (dx, -dy, 0), (-dx, -dy, 0)]
     elif n == "+Z": v_pos = [(-dx, 0, -dy), (dx, 0, -dy), (dx, 0, dy), (-dx, 0, dy)]
@@ -759,30 +851,105 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
     name = node_data.get("name", "Node")
     pos = hytale_to_blender_pos(node_data.get("position", {}))
     rot = hytale_to_blender_quat(node_data.get("orientation", {}))
+    
+    # --- 1. CREAR EL NODO PRINCIPAL (PADRE/PIVOTE) ---
+    node_empty = bpy.data.objects.new(name, None)
+    node_empty.empty_display_type = 'PLAIN_AXES'
+    node_empty.empty_display_size = 0.2
+    collection.objects.link(node_empty)
+    
+    node_empty.location = pos
+    node_empty.rotation_mode = 'QUATERNION'
+    node_empty.rotation_quaternion = rot
+    
+    if parent_obj: node_empty.parent = parent_obj
+    
+    # --- PRE-VERIFICACIÓN DE HIJOS ---
+    children_list = node_data.get("children", [])
+    has_children = len(children_list) > 0
+
+    # --- 2. CREAR LA FORMA (MESH) ---
     shape_data = node_data.get("shape", {})
     shape_type = shape_data.get("type", "none")
     
-    obj = None
-    if shape_type == 'box':
-        mesh = create_mesh_box_import(name, shape_data, texture_width, texture_height)
-        obj = bpy.data.objects.new(name, mesh)
-    elif shape_type == 'quad':
-        mesh = create_mesh_quad_import(name, shape_data, texture_width, texture_height)
-        obj = bpy.data.objects.new(name, mesh)
-    else:
-        obj = bpy.data.objects.new(name, None)
-        obj.empty_display_type = 'PLAIN_AXES'
-    
-    collection.objects.link(obj)
-    obj.location = pos
-    obj.rotation_mode = 'QUATERNION'
-    obj.rotation_quaternion = rot
-    if parent_obj: obj.parent = parent_obj
+    if shape_type != "none":
+        st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
         
-    for child in node_data.get("children", []):
-        process_node_import(child, obj, texture_width, texture_height, collection)
-    return obj
+        # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
+        if has_children:
+            # 1. Crear copia de shape SIN offset (para que la malla nazca en 0,0,0)
+            shape_copy = shape_data.copy()
+            shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
 
+            # 2. Crear la malla centrada
+            if shape_type == 'box':
+                mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
+            else:
+                mesh = create_mesh_quad_import(name + "_mesh", shape_copy, texture_width, texture_height)
+            
+            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
+            collection.objects.link(mesh_obj)
+
+            # 3. Calcular dónde debe ir el Wrapper
+            # Prioridad A: Offset explícito en JSON
+            raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
+            target_pos = hytale_to_blender_pos(raw_offset)
+            
+            # Prioridad B: Si el offset es 0, verificar si la geometría tiene desplazamiento interno (from/to)
+            # Esto corrige el caso donde 'offset' es 0 pero la caja está definida lejos del centro.
+            if target_pos.length_squared < 0.0001:
+                # Creamos una malla temporal con los datos originales para ver dónde cae
+                temp_mesh = None
+                if shape_type == 'box':
+                    temp_mesh = create_mesh_box_import("Temp", shape_data, texture_width, texture_height)
+                else:
+                    temp_mesh = create_mesh_quad_import("Temp", shape_data, texture_width, texture_height)
+                
+                # Calculamos su centro
+                center_vec = mathutils.Vector((0,0,0))
+                if temp_mesh.vertices:
+                    center_vec = sum((v.co for v in temp_mesh.vertices), mathutils.Vector()) / len(temp_mesh.vertices)
+                
+                # Si está lejos del centro, usamos esa posición como offset del Wrapper
+                if center_vec.length > 0.01:
+                    target_pos = center_vec
+                
+                # Limpiamos
+                bpy.data.meshes.remove(temp_mesh)
+
+            # 4. Crear el Wrapper (Geo) en la posición calculada
+            geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
+            geo_wrapper.empty_display_type = 'PLAIN_AXES'
+            geo_wrapper.empty_display_size = 0.2
+            collection.objects.link(geo_wrapper)
+            
+            geo_wrapper.parent = node_empty
+            geo_wrapper.location = target_pos # Aquí aplicamos la separación Padre <-> Geo
+            geo_wrapper.rotation_mode = 'QUATERNION'
+            geo_wrapper.rotation_quaternion = (1, 0, 0, 0)
+            
+            # 5. Malla dentro del Wrapper (en 0,0,0)
+            mesh_obj.parent = geo_wrapper
+            
+        else:
+            # Caso Normal (Sin hijos): Todo directo
+            if shape_type == 'box':
+                mesh = create_mesh_box_import(name + "_mesh", shape_data, texture_width, texture_height)
+            else:
+                mesh = create_mesh_quad_import(name + "_mesh", shape_data, texture_width, texture_height)
+                
+            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
+            collection.objects.link(mesh_obj)
+            mesh_obj.parent = node_empty
+            
+        mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
+
+    # --- 3. PROCESAR HIJOS ---
+    for child in children_list:
+        process_node_import(child, node_empty, texture_width, texture_height, collection)
+        
+    return node_empty
+    
 # --- OPERADORES ---
 
 class OPS_OT_SetupHytaleScene(bpy.types.Operator):
@@ -1480,6 +1647,8 @@ class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
             # ---------------------------------------------------------
             # CONFIGURACIÓN AUTOMÁTICA (FULL COMBO)
             # ---------------------------------------------------------
+            
+  
             
             # 1. Asegurar Modo Edición
             if context.active_object and context.active_object.mode != 'EDIT':
