@@ -2,6 +2,14 @@
 # CAMBIOS RECIENTES
 
 # fixed version of HytaleModelExporterPre.py
+# Changes:
+# - v0.33: "Safety Check" Popup on Export.
+# - v0.34: Compact JSON formatting.
+# - v0.35: Math fix logic.
+# - v0.36: Attempted bpy.ops (Context sensitive).
+# - v0.37: MATRIX MATH FIX (Hard). Se aplica manualmente la multiplicación de matrices
+#          (ParentInverse @ Local) para garantizar que el "Apply Parent Inverse" ocurra
+#          sin depender del contexto visual o selección de Blender.
 
 bl_info = {
     "name": "Hytale Model Tools (Import/Export)",
@@ -9,7 +17,7 @@ bl_info = {
     "version": (0, 38),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Hytale",
-    "description": "Exportador v0.38",
+    "description": "Exportador v0.37 (Matrix Math Hard Fix).",
     "category": "Import-Export",
 }
 
@@ -46,33 +54,87 @@ def get_image_size_from_objects(objects):
 
 def update_hytale_grid_setup(self, context):
     """
-    Configura el entorno base:
-    ON: Unidades 'NONE', Escala 2.0, Subdivisiones 32.
-    OFF: Unidades 'METRIC', Escala 1.0, Subdivisiones 10.
+    Configura el entorno Hytale usando la API descubierta (space.uv_editor).
     """
+    # 1. Ajuste de Unidades (Global)
     if self.setup_pixel_grid:
-        # 1. Configurar Unidades
         context.scene.unit_settings.system = 'NONE'
-        
-        # 2. Aplicar Escala 2.0 y Subdivisiones 32 a los visores
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        space.overlay.grid_scale = 1
-                        space.overlay.grid_subdivisions = 16
-                        space.overlay.show_floor = True
     else:
-        # RESET: Volver a valores por defecto de Blender
         context.scene.unit_settings.system = 'METRIC'
-        self.show_subdivisions = False # Desactivar el sub-checkbox
-        
-        for area in context.screen.areas:
+        self.show_subdivisions = False
+
+    # 2. Configurar VIEW_3D (Grid del suelo)
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
             if area.type == 'VIEW_3D':
                 for space in area.spaces:
                     if space.type == 'VIEW_3D':
-                        space.overlay.grid_scale = 1.0
-                        space.overlay.grid_subdivisions = 10
+                        if self.setup_pixel_grid:
+                            space.overlay.grid_scale = 1
+                            space.overlay.grid_subdivisions = 16
+                            space.overlay.show_floor = True
+                        else:
+                            space.overlay.grid_scale = 1.0
+                            space.overlay.grid_subdivisions = 10
+
+    # 3. [CORREGIDO] Configurar UV EDITOR con la API 'space.uv_editor'
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            # Buscamos por ui_type='UV' para dar con el editor correcto
+            if area.ui_type == 'UV': 
+                area.tag_redraw()
+                for space in area.spaces:
+                    if space.type == 'IMAGE_EDITOR':
+                        # Verificamos si existe el sub-objeto que encontraste en el log
+                        if hasattr(space, 'uv_editor'):
+                            uv_settings = space.uv_editor
+                            
+                            if self.setup_pixel_grid:
+                                # --- ACTIVAR MODO PIXEL PERFECT ---
+                                
+                                # 1. Ver las caras (malla rellena)
+                                uv_settings.show_faces = True 
+                                
+                                # 2. Activar la rejilla sobre la imagen
+                                uv_settings.show_grid_over_image = True
+                                
+                                
+                                # 3. Configurar la fuente de la rejilla a PIXELES
+                                # (Esto sustituye al antiguo show_pixel_grid)
+                                try:
+                                    uv_settings.grid_shape_source = 'PIXEL'
+                                except Exception:
+                                    # Si 'PIXEL' falla, probamos 'DYNAMIC' o lo dejamos estar
+                                    pass
+                                
+                                # 4. Desactivar distorsión
+                                uv_settings.show_stretch = False
+                                
+                            else:
+                                # --- DESACTIVAR ---
+                                uv_settings.show_grid_over_image = False
+                                # Opcional: apagar caras
+                                # uv_settings.show_faces = False
+                                
+                        if hasattr(space, 'overlay'):
+                            uv_settings2 = space.overlay
+
+                            if self.setup_pixel_grid:
+                                # --- ACTIVAR MODO PIXEL PERFECT ---
+                                try:
+                                    # 1. Ver las caras (malla rellena)
+                                    uv_settings2.show_overlays = True 
+                                
+                                    # 2. Activar la rejilla sobre la imagen
+                                    uv_settings2.show_grid_background = True
+                                
+                                except Exception:
+                                    pass
+                                
+                            else:
+                                # --- DESACTIVAR ---
+                                uv_settings2.show_grid_background = False
+                                uv_settings.show_grid_over_image = False
 
 def update_grid_subdivisions(self, context):
     """Lógica relativa: Divide o multiplica la escala actual por 16"""
@@ -441,64 +503,3 @@ def reconstruct_orientation_from_geometry(obj):
     Fix v24.17: Soporte para Quads usando vectores de arista si falta una 2da cara.
     """
     if obj.type != 'MESH': return
-    
-    mesh = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    
-    if not bm.faces:
-        bm.free()
-        return
-
-    # Recolectar normales y áreas
-    face_data = []
-    for f in bm.faces:
-        face_data.append((f.normal.copy(), f.calc_area()))
-    
-    # Ordenar por área (la cara más grande domina)
-    face_data.sort(key=lambda x: x[1], reverse=True)
-    
-    axes = [mathutils.Vector((1,0,0)), mathutils.Vector((-1,0,0)),
-            mathutils.Vector((0,1,0)), mathutils.Vector((0,-1,0)),
-            mathutils.Vector((0,0,1)), mathutils.Vector((0,0,-1))]
-
-    # 1. Encontrar el Eje Principal (Normal de la cara más grande)
-    n1 = face_data[0][0]
-    best_axis_1 = max(axes, key=lambda a: n1.dot(a))
-    rot1 = n1.rotation_difference(best_axis_1)
-    
-    # 2. Encontrar el Eje Secundario
-    n2 = None
-    
-    # Intento A: Buscar otra cara perpendicular (Funciona para Cubos)
-    for item in face_data:
-        n_curr = item[0]
-        if abs(n_curr.cross(n1).length) > 0.1: 
-            n2 = n_curr
-            break
-            
-    # Intento B: (FIX para Quads) Si no hay cara perpendicular, usar un borde de la cara principal
-    if not n2:
-        # Buscamos la cara principal en el bmesh (la de mayor área)
-        best_face = max(bm.faces, key=lambda f: f.calc_area())
-        if best_face and len(best_face.verts) >= 2:
-            # Usamos el vector de la primera arista como dirección secundaria
-            v1 = best_face.verts[0].co
-            v2 = best_face.verts[1].co
-            edge_vec = (v2 - v1).normalized()
-            
-            # Asegurar que no sea paralelo a n1 (matemáticamente imposible en un plano válido, pero por seguridad)
-            if abs(edge_vec.cross(n1).length) > 0.01:
-                n2 = edge_vec
-
-    rot2 = mathutils.Quaternion() 
-    if n2:
-        n2_prime = n2.copy()
-        n2_prime.rotate(rot1) # Aplicar la primera rotación al vector secundario
-        
-        # Buscar el eje global más cercano que sea perpendicular a best_axis_1
-        valid_axes_2 = [a for a in axes if abs(a.dot(best_axis_1)) < 0.01]
-        
-        if valid_axes_2:
-            best_axis_2 = max(valid_axes_2, key=lambda a: n2_prime.dot(a))
-            rot2 = n2_prime.rotation_difference(best_axis_2)

@@ -1,6 +1,174 @@
 # PARTE 3/4 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+        
+        # Validación rápida de seguridad
+        # Iteramos directamente sobre 'target_col'
+        for obj in target_col.objects:
+            if obj.type == 'MESH':
+                if obj.scale.x < 0 or obj.scale.y < 0 or obj.scale.z < 0: issues_found = True
+                if not obj.data.materials: issues_found = True
+                if len(obj.data.vertices) > 8: issues_found = True
+                if obj.parent and obj.parent.type == 'MESH': issues_found = True
+        
+        if issues_found:
+             return context.window_manager.invoke_props_dialog(self, width=600)
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.ui_units_x = 20
+        col = layout.column()
+        col.alert = True
+        col.label(text="¡ADVERTENCIA!", icon='ERROR')
+        col.label(text="Errores detectados. ¿Exportar de todas formas?")
+
+    def execute(self, context):
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        props = context.scene.hytale_props
+        target_col = props.target_collection
+        
+        if not target_col:
+            self.report({'ERROR'}, "No has seleccionado ninguna colección.")
+            return {'CANCELLED'}
+            
+        output_path = bpy.path.abspath(props.file_path)
+        if not output_path:
+            self.report({'ERROR'}, "Ruta de archivo no definida.")
+            return {'CANCELLED'}
+        if not output_path.lower().endswith(".blockymodel"): output_path += ".blockymodel"
+        
+        # --- LÓGICA DE TEXTURA / RESOLUCIÓN ---
+        tex_w, tex_h = 64, 64 # Valor por defecto seguro
+        
+        if props.resolution_mode == 'IMAGE':
+            if props.target_image:
+                tex_w = props.target_image.size[0]
+                tex_h = props.target_image.size[1]
+            else:
+                self.report({'WARNING'}, "Modo Textura activado pero sin imagen. Usando 64x64.")
+        else:
+            # Modo Manual
+            tex_w = props.tex_width
+            tex_h = props.tex_height
+        # --------------------------------------
+        
+        # Crear colección temporal para procesar sin destruir la escena
+        temp_col = bpy.data.collections.new("Hytale_Export_Temp")
+        context.scene.collection.children.link(temp_col)
+        
+        try:
+            # Procesamos la colección (separa jerarquía, arregla rotaciones)
+            processed_roots = process_and_decompose_collection(target_col, temp_col)
+            
+            id_counter = [0]
+            # Pasamos las dimensiones (tex_w, tex_h) calculadas arriba
+            nodes_array = [process_node(root, tex_w, tex_h, props.snap_uvs, id_counter) for root in processed_roots]
+            
+            final_json = { 
+                "nodes": nodes_array, 
+                "format": "character", 
+                "textureWidth": int(tex_w), 
+                "textureHeight": int(tex_h) 
+            }
+            
+            # --- BLOQUE OPTIMIZADO: Formato Compacto ---
+            # 1. Generamos JSON con indentación vertical limpia
+            json_str = json.dumps(final_json, indent=1)
+            
+            # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
+            # Convierte:
+            # {
+            #  "x": 10,
+            #  "y": 5,
+            #  "z": 0
+            # }
+            # a: {"x": 10, "y": 5, "z": 0}
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 3. OPTIMIZACIÓN: Colapsar Cuaterniones {x,y,z,w}
+            json_str = re.sub(
+                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+),\s*"w":\s*([\d\.-]+)\s*\}', 
+                r'{"x": \1, "y": \2, "z": \3, "w": \4}', 
+                json_str, 
+                flags=re.DOTALL
+            )
+            
+            # 4. Escritura
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+                
+            self.report({'INFO'}, f"Exportado exitosamente: {output_path}")
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Error Crítico: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+            
+        finally:
+            # Limpieza de temporales
+            if temp_col:
+                for obj in temp_col.objects:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.collections.remove(temp_col)
+
+        return {'FINISHED'}
+
+class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
+    bl_idname = "hytale.import_model"
+    bl_label = "Seleccionar .blockymodel"
+    filename_ext = ".blockymodel"
+    filter_glob: bpy.props.StringProperty(default="*.blockymodel;*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        try:
+            with open(self.filepath, 'r') as f: data = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"Error: {e}")
+            return {'CANCELLED'}
+            
+        model_name = os.path.splitext(os.path.basename(self.filepath))[0]
+        col = bpy.data.collections.new(model_name)
+        context.scene.collection.children.link(col)
+        
+        tex_w = data.get("textureWidth", 64)
+        tex_h = data.get("textureHeight", 64)
+        tex_path = os.path.splitext(self.filepath)[0] + ".png"
+        material = setup_import_material(tex_path, tex_w, tex_h)
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        for node in data.get("nodes", []):
+            root_obj = process_node_import(node, None, tex_w, tex_h, col)
+            if root_obj:
+                for o in [root_obj] + [c for c in root_obj.children_recursive]:
+                    if o.type == 'MESH':
+                        if not o.data.materials: o.data.materials.append(material)
+                        else: o.data.materials[0] = material
+        
+        self.report({'INFO'}, f"Importado: {model_name}")
+        return {'FINISHED'}
+
+class OPS_OT_PixelPerfectPack(bpy.types.Operator):
+    bl_idname = "hytale.pixel_perfect_pack"
+    bl_label = "Scale UV's To Pixel Perfect"
+    bl_description = "Alinea, escala y (opcionalmente) stackea UVs por intersección."
+
+    def execute(self, context):
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_meshes:
+            self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
+            return {'CANCELLED'}
+
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         context.view_layer.objects.active = selected_meshes[0]
         bpy.ops.object.join()
@@ -337,168 +505,3 @@ def draw_uv_stats_callback(self, context):
                             tex_w, tex_h = n.image.size
                             break
                 except: pass
-
-            # --- RECOLECTAR BORDES ---
-            if show_edges:
-                for face in bm.faces:
-                    for loop in face.loops:
-                        l_curr = loop
-                        l_next = loop.link_loop_next
-                        
-                        u_data1 = l_curr[uv_layer]
-                        u_data2 = l_next[uv_layer]
-                        
-                        is_selected = False
-                        if use_sync:
-                            if l_curr.edge.select: is_selected = True
-                        else:
-                            if u_data1.select and u_data2.select: is_selected = True
-                        
-                        if not is_selected: continue
-                        
-                        uv1 = u_data1.uv
-                        uv2 = u_data2.uv
-                        
-                        mid_u = (uv1.x + uv2.x) / 2
-                        mid_v = (uv1.y + uv2.y) / 2
-                        sx, sy = uv_to_region(mid_u, mid_v)
-
-                        # Calculamos distancia contra el ÚLTIMO CLIC
-                        dist_target = ((sx - target_x)**2 + (sy - target_y)**2)**0.5
-                        
-                        px_dist = ((uv1.x - uv2.x) * tex_w)**2 + ((uv1.y - uv2.y) * tex_h)**2
-                        px_len = px_dist**0.5
-                        if px_len < 0.1: continue
-                        text = f"{px_len:.1f}px"
-
-                        unique_id = (obj.name, 'EDGE', l_curr.edge.index)
-                        if unique_id not in candidates: candidates[unique_id] = []
-                        candidates[unique_id].append( (dist_target, sx, sy, text) )
-
-            # --- RECOLECTAR CARAS ---
-            if show_faces:
-                for face in bm.faces:
-                    is_face_selected = False
-                    if use_sync:
-                        if face.select: is_face_selected = True
-                    else:
-                        loops_uv = [l[uv_layer] for l in face.loops]
-                        if all(l.select for l in loops_uv): is_face_selected = True
-                    
-                    if not is_face_selected: continue
-
-                    uvs = [l[uv_layer].uv for l in face.loops]
-                    if not uvs: continue
-                    
-                    min_u, max_u = min(u.x for u in uvs), max(u.x for u in uvs)
-                    min_v, max_v = min(u.y for u in uvs), max(u.y for u in uvs)
-                    
-                    w_px = (max_u - min_u) * tex_w
-                    h_px = (max_v - min_v) * tex_h
-
-                    cx_center, cy_center = uv_to_region((min_u + max_u)/2, (min_v + max_v)/2)
-                    dist_target = ((cx_center - target_x)**2 + (cy_center - target_y)**2)**0.5
-
-                    cx_w, cy_w = uv_to_region((min_u + max_u)/2, min_v)
-                    cx_h, cy_h = uv_to_region(min_u, (min_v + max_v)/2)
-
-                    unique_id = (obj.name, 'FACE', face.index)
-                    if unique_id not in candidates: candidates[unique_id] = []
-                    candidates[unique_id].append( (dist_target, cx_w, cy_w, cx_h, cy_h, w_px, h_px) )
-
-        except Exception:
-            continue
-        finally:
-            if bm: bm.free()
-
-    # --- DIBUJADO FINAL ---
-    for uid, locations in candidates.items():
-        # Ordenamos por cercanía al último clic
-        locations.sort(key=lambda x: x[0])
-        best_match = locations[0]
-        
-        if uid[1] == 'EDGE':
-            _, sx, sy, text = best_match
-            blf.position(font_id, sx, sy, 0)
-            blf.draw(font_id, text)
-            
-        elif uid[1] == 'FACE':
-            _, cx_w, cy_w, cx_h, cy_h, w_px, h_px = best_match
-            blf.position(font_id, cx_w, cy_w - 20, 0)
-            blf.draw(font_id, f"W: {w_px:.1f}")
-            blf.position(font_id, cx_h - 50, cy_h, 0)
-            blf.draw(font_id, f"H: {h_px:.1f}")
-
-class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
-    """Activa medidas UV, Sync, Modo Caras y Selecciona Todo"""
-    bl_idname = "hytale.toggle_uv_measures"
-    bl_label = "Ver Medidas UV (Full Setup)"
-    
-    def force_uv_redraw(self, context):
-        for window in context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'IMAGE_EDITOR':
-                    area.tag_redraw()
-    
-    def modal(self, context, event):
-        global uv_measures_running, last_click_abs_x, last_click_abs_y, draw_handle_uv_stats
-        
-        if not uv_measures_running:
-            if draw_handle_uv_stats:
-                bpy.types.SpaceImageEditor.draw_handler_remove(draw_handle_uv_stats, 'WINDOW')
-                draw_handle_uv_stats = None
-            
-            context.scene.hytale_uv_active = False
-            self.force_uv_redraw(context)
-            return {'FINISHED'}
-        
-        # --- COMPORTAMIENTO: SOLO CLIC ---
-        is_action = False
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE'} and event.value == 'PRESS':
-            is_action = True
-        elif event.type not in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'TIMER', 'TIMER_REPORT'} and event.value == 'PRESS':
-            is_action = True
-            
-        if is_action:
-            last_click_abs_x = event.mouse_x
-            last_click_abs_y = event.mouse_y
-            self.force_uv_redraw(context)
-            
-        return {'PASS_THROUGH'}
-
-    def invoke(self, context, event):
-        global uv_measures_running, draw_handle_uv_stats, last_click_abs_x, last_click_abs_y
-        
-        if uv_measures_running:
-            uv_measures_running = False
-            self.report({'INFO'}, "Medidas UV: DESACTIVADO")
-            return {'FINISHED'}
-        else:
-            uv_measures_running = True
-            context.scene.hytale_uv_active = True
-            
-            # ---------------------------------------------------------
-            # CONFIGURACIÓN AUTOMÁTICA (FULL COMBO)
-            # ---------------------------------------------------------
-            
-            # 1. Asegurar Modo Edición
-            if context.active_object and context.active_object.mode != 'EDIT':
-                bpy.ops.object.mode_set(mode='EDIT')
-            
-            # 2. ACTIVAR UV SYNC (¡Lo nuevo!)
-            context.scene.tool_settings.use_uv_select_sync = True
-            
-            # 3. Cambiar a MODO CARAS
-            # Como Sync está activo, controlamos la selección 3D
-            context.tool_settings.mesh_select_mode = (False, False, True) 
-            
-            # 4. Seleccionar TODO
-            try:
-                bpy.ops.mesh.select_all(action='SELECT')
-            except:
-                pass
-            
-            # ---------------------------------------------------------
-
-            last_click_abs_x = event.mouse_x
-            last_click_abs_y = event.mouse_y
