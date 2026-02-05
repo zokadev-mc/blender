@@ -2,6 +2,104 @@
 # CAMBIOS RECIENTES
 
 
+    tex_width: bpy.props.IntProperty(
+        name="Ancho (W)",
+        default=64,
+        min=1
+    )
+    tex_height: bpy.props.IntProperty(
+        name="Alto (H)",
+        default=64,
+        min=1
+    )
+    
+    snap_uvs: bpy.props.BoolProperty(
+        name="Snap UVs a Píxeles",
+        default=True
+    )
+    file_path: bpy.props.StringProperty(name="Guardar como", default="//modelo.blockymodel", subtype='FILE_PATH')
+    
+    # Props de configuración de escena y UVs
+    setup_pixel_grid: bpy.props.BoolProperty(name="Setup Pixel Perfect", default=False, update=update_hytale_grid_setup)
+    show_subdivisions: bpy.props.BoolProperty(name="Ver Subdivisiones", default=False, update=update_grid_subdivisions)
+    new_unwrap: bpy.props.BoolProperty(name="Generar Nuevo Unwrap", default=False)
+    auto_stack: bpy.props.BoolProperty(name="Auto Stack Similar", default=False) 
+    selected_reference: bpy.props.EnumProperty(name="Referencia", items=get_templates_list)
+    
+# --- VARIABLES GLOBALES ---
+uv_measures_running = False
+# Estas variables guardarán SIEMPRE la posición del último clic válido
+last_click_abs_x = 0  
+last_click_abs_y = 0
+draw_handle_uv_stats = None
+
+def draw_uv_stats_callback(self, context):
+    global last_click_abs_x, last_click_abs_y
+    
+    # 1. Validar contexto
+    objects_in_edit = [o for o in context.selected_objects if o.type == 'MESH' and o.mode == 'EDIT']
+    if not objects_in_edit: return
+
+    region = context.region 
+    scene = context.scene
+    
+    # --- LA LÓGICA DE ORO ---
+    # Calculamos la posición del objetivo basándonos en el ÚLTIMO CLIC guardado.
+    # Restamos region.x/y para convertir la coordenada absoluta de la ventana
+    # a la coordenada local de este editor UV específico.
+    target_x = last_click_abs_x - region.x
+    target_y = last_click_abs_y - region.y
+
+    # Configuración de Fuente
+    font_id = 0
+    try: blf.size(font_id, 15)
+    except: pass
+    blf.color(font_id, 1, 0.9, 0, 1) 
+    blf.enable(font_id, blf.SHADOW)
+    blf.shadow(font_id, 3, 0, 0, 0, 0.8)
+
+    # Configuración Global
+    use_sync = scene.tool_settings.use_uv_select_sync
+    
+    # Detección de Modo
+    show_edges = False
+    show_faces = False
+    if use_sync:
+        msm = context.tool_settings.mesh_select_mode
+        if msm[0] or msm[1]: show_edges = True
+        if msm[2]: show_faces = True
+    else:
+        usm = context.tool_settings.uv_select_mode
+        if usm in {'VERTEX', 'EDGE'}: show_edges = True
+        if usm in {'FACE', 'ISLAND'}: show_faces = True
+
+    def uv_to_region(u, v):
+        x, y = region.view2d.view_to_region(u, v)
+        return int(x), int(y)
+
+    candidates = {}
+
+    for obj in objects_in_edit:
+        bm = None
+        try:
+            me = obj.data
+            bm_orig = bmesh.from_edit_mesh(me)
+            bm = bm_orig.copy()
+            
+            uv_layer = bm.loops.layers.uv.active
+            if not uv_layer:
+                bm.free()
+                continue
+
+            tex_w, tex_h = 64, 64
+            if obj.active_material and obj.active_material.use_nodes:
+                try:
+                    for n in obj.active_material.node_tree.nodes:
+                        if n.type == 'TEX_IMAGE' and n.image:
+                            tex_w, tex_h = n.image.size
+                            break
+                except: pass
+
             # --- RECOLECTAR BORDES ---
             if show_edges:
                 for face in bm.faces:

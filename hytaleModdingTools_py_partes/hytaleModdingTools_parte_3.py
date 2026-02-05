@@ -1,6 +1,85 @@
 # PARTE 3/4 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+            
+            # EMPARENTAMIENTO EN CADENA
+            geo_wrapper.parent = node_empty
+            geo_wrapper.location = target_pos
+            mesh_obj.parent = geo_wrapper
+            
+        else:
+            # Caso Normal: Malla directa al Empty
+            if shape_type == 'box':
+                mesh = create_mesh_box_import(name + "_mesh", shape_data, texture_width, texture_height)
+            else:
+                mesh = create_mesh_quad_import(name + "_mesh", shape_data, texture_width, texture_height)
+                
+            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
+            collection.objects.link(mesh_obj)
+            
+            # EMPARENTAMIENTO DIRECTO
+            mesh_obj.parent = node_empty
+            
+        # Aplicar escala (esto ahora se hace después de asegurar que mesh_obj existe)
+        if mesh_obj:
+            mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
+
+    # --- 3. PROCESAR HIJOS ---
+    for child in children_list:
+        process_node_import(child, node_empty, texture_width, texture_height, collection)
+        
+    return node_empty
+    
+# --- OPERADORES ---
+
+class OPS_OT_SetupHytaleScene(bpy.types.Operator):
+    bl_idname = "hytale.setup_scene"
+    bl_label = "Configurar Escena"
+    def execute(self, context):
+        context.scene.unit_settings.system = 'NONE'
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.overlay.show_floor = True
+                        space.overlay.grid_scale = 2.0      
+                        space.overlay.grid_subdivisions = 16 
+        return {'FINISHED'}
+
+class OPS_OT_LoadReference(bpy.types.Operator):
+    bl_idname = "hytale.load_reference"
+    bl_label = "Cargar Referencia"
+    def execute(self, context):
+        props = context.scene.hytale_props
+        filename = props.selected_reference
+        if filename == 'NONE': return {'CANCELLED'}
+        folder_path = get_templates_path()
+        filepath = os.path.join(folder_path, filename)
+        if not os.path.exists(filepath): return {'CANCELLED'}
+        try:
+            with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                data_to.collections = data_from.collections
+            for col in data_to.collections:
+                if col is not None: context.scene.collection.children.link(col)
+        except Exception as e:
+            self.report({'ERROR'}, f"Error: {str(e)}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+class OPS_OT_ExportHytale(bpy.types.Operator):
+    bl_idname = "hytale.export_model"
+    bl_label = "Exportar Modelo Hytale"
+    
+    def invoke(self, context, event):
+        props = context.scene.hytale_props
+        # CAMBIO: Usamos la colección directa
+        target_col = props.target_collection
+        issues_found = False
+        
+        # 1. Validación básica: ¿Existe la colección?
+        if not target_col:
+            self.report({'ERROR'}, "Por favor, selecciona una colección.")
+            return {'CANCELLED'}
         
         # Validación rápida de seguridad
         # Iteramos directamente sobre 'target_col'
@@ -41,14 +120,14 @@
         if not output_path.lower().endswith(".blockymodel"): output_path += ".blockymodel"
         
         # --- LÓGICA DE TEXTURA / RESOLUCIÓN ---
-        tex_w, tex_h = 64, 64 # Valor por defecto seguro
+        tex_w, tex_h = 32, 32 # Valor por defecto seguro
         
         if props.resolution_mode == 'IMAGE':
             if props.target_image:
                 tex_w = props.target_image.size[0]
                 tex_h = props.target_image.size[1]
             else:
-                self.report({'WARNING'}, "Modo Textura activado pero sin imagen. Usando 64x64.")
+                self.report({'WARNING'}, "Modo Textura activado pero sin imagen. Usando 32x32.")
         else:
             # Modo Manual
             tex_w = props.tex_width
@@ -122,38 +201,58 @@
 
         return {'FINISHED'}
 
+# 1. Definimos las opciones de resolución (Múltiplos de 32)
+# Esto genera una lista de tuplas: ('32', '32', ''), ('64', '64', ''), etc.
+hytale_res_list = [('0', "Automático (JSON)", "Usa los valores del archivo")]
+for i in range(1, 33):
+    val = str(i * 32)
+    hytale_res_list.append((val, val, f"Resolución {val}px"))
+
 class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
     bl_idname = "hytale.import_model"
-    bl_label = "Seleccionar .blockymodel"
+    bl_label = "Importar Modelo Hytale"
     filename_ext = ".blockymodel"
-    filter_glob: bpy.props.StringProperty(default="*.blockymodel;*.json", options={'HIDDEN'})
+    
+    res_w: bpy.props.EnumProperty(
+        name="Ancho UV",
+        items=hytale_res_list,
+        default='0'
+    )
+    res_h: bpy.props.EnumProperty(
+        name="Alto UV",
+        items=hytale_res_list,
+        default='0'
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Resolución UV Manual", icon='UV_DATA')
+        row = box.row(align=True)
+        row.prop(self, "res_w", text="W")
+        row.prop(self, "res_h", text="H")
 
     def execute(self, context):
         try:
-            with open(self.filepath, 'r') as f: data = json.load(f)
+            with open(self.filepath, 'r') as f:
+                data = json.load(f)
         except Exception as e:
             self.report({'ERROR'}, f"Error: {e}")
             return {'CANCELLED'}
-            
+
+        # Lógica de resolución: Prioridad al menú, luego al JSON
+        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 64)
+        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 64)
+
         model_name = os.path.splitext(os.path.basename(self.filepath))[0]
         col = bpy.data.collections.new(model_name)
         context.scene.collection.children.link(col)
-        
-        tex_w = data.get("textureWidth", 64)
-        tex_h = data.get("textureHeight", 64)
-        tex_path = os.path.splitext(self.filepath)[0] + ".png"
-        material = setup_import_material(tex_path, tex_w, tex_h)
-        
-        bpy.ops.object.select_all(action='DESELECT')
+
+        # Iniciar importación recursiva
         for node in data.get("nodes", []):
-            root_obj = process_node_import(node, None, tex_w, tex_h, col)
-            if root_obj:
-                for o in [root_obj] + [c for c in root_obj.children_recursive]:
-                    if o.type == 'MESH':
-                        if not o.data.materials: o.data.materials.append(material)
-                        else: o.data.materials[0] = material
-        
-        self.report({'INFO'}, f"Importado: {model_name}")
+            process_node_import(node, None, tex_w, tex_h, col)
+
+        self.report({'INFO'}, f"Importado con resolución: {tex_w}x{tex_h}")
         return {'FINISHED'}
 
 class OPS_OT_PixelPerfectPack(bpy.types.Operator):
@@ -179,7 +278,7 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         
         props = context.scene.hytale_props
         tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 64, 64 
+        if not tex_w: tex_w, tex_h = 64, 64
 
         bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(main_obj.data)
@@ -407,101 +506,3 @@ class HytaleProperties(bpy.types.PropertyGroup):
         update=update_target_texture
     )
     # ---------------------------------------
-
-    tex_width: bpy.props.IntProperty(
-        name="Ancho (W)",
-        default=64,
-        min=1
-    )
-    tex_height: bpy.props.IntProperty(
-        name="Alto (H)",
-        default=64,
-        min=1
-    )
-    
-    snap_uvs: bpy.props.BoolProperty(
-        name="Snap UVs a Píxeles",
-        default=True
-    )
-    file_path: bpy.props.StringProperty(name="Guardar como", default="//modelo.blockymodel", subtype='FILE_PATH')
-    
-    # Props de configuración de escena y UVs
-    setup_pixel_grid: bpy.props.BoolProperty(name="Setup Pixel Perfect", default=False, update=update_hytale_grid_setup)
-    show_subdivisions: bpy.props.BoolProperty(name="Ver Subdivisiones", default=False, update=update_grid_subdivisions)
-    new_unwrap: bpy.props.BoolProperty(name="Generar Nuevo Unwrap", default=False)
-    auto_stack: bpy.props.BoolProperty(name="Auto Stack Similar", default=False) 
-    selected_reference: bpy.props.EnumProperty(name="Referencia", items=get_templates_list)
-    
-# --- VARIABLES GLOBALES ---
-uv_measures_running = False
-# Estas variables guardarán SIEMPRE la posición del último clic válido
-last_click_abs_x = 0  
-last_click_abs_y = 0
-draw_handle_uv_stats = None
-
-def draw_uv_stats_callback(self, context):
-    global last_click_abs_x, last_click_abs_y
-    
-    # 1. Validar contexto
-    objects_in_edit = [o for o in context.selected_objects if o.type == 'MESH' and o.mode == 'EDIT']
-    if not objects_in_edit: return
-
-    region = context.region 
-    scene = context.scene
-    
-    # --- LA LÓGICA DE ORO ---
-    # Calculamos la posición del objetivo basándonos en el ÚLTIMO CLIC guardado.
-    # Restamos region.x/y para convertir la coordenada absoluta de la ventana
-    # a la coordenada local de este editor UV específico.
-    target_x = last_click_abs_x - region.x
-    target_y = last_click_abs_y - region.y
-
-    # Configuración de Fuente
-    font_id = 0
-    try: blf.size(font_id, 15)
-    except: pass
-    blf.color(font_id, 1, 0.9, 0, 1) 
-    blf.enable(font_id, blf.SHADOW)
-    blf.shadow(font_id, 3, 0, 0, 0, 0.8)
-
-    # Configuración Global
-    use_sync = scene.tool_settings.use_uv_select_sync
-    
-    # Detección de Modo
-    show_edges = False
-    show_faces = False
-    if use_sync:
-        msm = context.tool_settings.mesh_select_mode
-        if msm[0] or msm[1]: show_edges = True
-        if msm[2]: show_faces = True
-    else:
-        usm = context.tool_settings.uv_select_mode
-        if usm in {'VERTEX', 'EDGE'}: show_edges = True
-        if usm in {'FACE', 'ISLAND'}: show_faces = True
-
-    def uv_to_region(u, v):
-        x, y = region.view2d.view_to_region(u, v)
-        return int(x), int(y)
-
-    candidates = {}
-
-    for obj in objects_in_edit:
-        bm = None
-        try:
-            me = obj.data
-            bm_orig = bmesh.from_edit_mesh(me)
-            bm = bm_orig.copy()
-            
-            uv_layer = bm.loops.layers.uv.active
-            if not uv_layer:
-                bm.free()
-                continue
-
-            tex_w, tex_h = 64, 64
-            if obj.active_material and obj.active_material.use_nodes:
-                try:
-                    for n in obj.active_material.node_tree.nodes:
-                        if n.type == 'TEX_IMAGE' and n.image:
-                            tex_w, tex_h = n.image.size
-                            break
-                except: pass
