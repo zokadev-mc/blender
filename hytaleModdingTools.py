@@ -723,31 +723,131 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     if not bm.loops.layers.uv: bm.loops.layers.uv.new()
     uv_layer = bm.loops.layers.uv.active
     
+    # 1. Datos del JSON
     off_x = data.get("offset", {}).get("x", 0)
     off_y = data.get("offset", {}).get("y", 0)
     ang = data.get("angle", 0)
     
-    box_w, box_h = (fh, fw) if ang in [90, 270] else (fw, fh)
-    real_x, real_y = off_x, off_y
+    mirror = data.get("mirror", {})
+    # Detectar si es mirror 'true' (bool) o diccionario
+    if isinstance(mirror, bool):
+         mir_x = mirror
+         mir_y = False
+    else:
+         mir_x = mirror.get("x", False)
+         mir_y = mirror.get("y", False)
+
+    # 2. DEFINIR EL SIZE UV
+    size_u = fh if ang in [90, 270] else fw
+    size_v = fw if ang in [90, 270] else fh
     
-    if ang == 90:    real_x = off_x - box_w
-    elif ang == 180: real_x = off_x - box_w; real_y = off_y - box_h
-    elif ang == 270: real_y = off_y - box_h
+    # 3. RECUPERAR EL OFFSET BASE
+    base_x = off_x
+    base_y = off_y
+    
+    if ang == 90:
+        base_x = off_x - size_u
+    elif ang == 180:
+        base_x = off_x - size_u
+        base_y = off_y - size_v
+    elif ang == 270:
+        base_y = off_y - size_v
 
-    u0 = real_x / tex_w
-    u1 = (real_x + box_w) / tex_w
-    v0 = 1.0 - (real_y / tex_h)
-    v1 = 1.0 - ((real_y + box_h) / tex_h)
+    # 4. APLICAR LOGICA DE MIRROR
+    # Si mirror es False, NO entra aquí y NO se hace ningún cambio (se respeta tu lógica original).
+    # Si mirror es True, solo invertimos el tamaño para que vaya "hacia atrás".
+    
+    if mir_x:
+        # NO tocamos base_x (el offset 24 ya es correcto como punto de partida)
+        size_u = -size_u  # Solo invertimos la dirección: 20 -> -20.
+        
+    if mir_y:
+        # NO tocamos base_y
+        size_v = -size_v
 
-    uv_coords = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
-    if ang == 90:    uv_coords = [uv_coords[3], uv_coords[0], uv_coords[1], uv_coords[2]]
-    elif ang == 180: uv_coords = [uv_coords[2], uv_coords[3], uv_coords[0], uv_coords[1]]
-    elif ang == 270: uv_coords = [uv_coords[1], uv_coords[2], uv_coords[3], uv_coords[0]]
+    # 5. CALCULAR COORDENADAS FINALES
+    # Ejemplo Mirror: base_x=24, size_u=-20.
+    # u0 = 24. u1 = 24 + (-20) = 4. -> Rango correcto de 24 a 4.
+    
+    u0 = base_x / tex_w
+    u1 = (base_x + size_u) / tex_w
+    
+    v0 = 1.0 - (base_y / tex_h)
+    v1 = 1.0 - ((base_y + size_v) / tex_h)
 
-    face.loops[3][uv_layer].uv = uv_coords[0] 
-    face.loops[2][uv_layer].uv = uv_coords[1] 
-    face.loops[1][uv_layer].uv = uv_coords[2] 
-    face.loops[0][uv_layer].uv = uv_coords[3] 
+    coords = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+
+    if ang == 90:
+        coords = [coords[1], coords[2], coords[3], coords[0]]
+    elif ang == 180:
+        coords = [coords[2], coords[3], coords[0], coords[1]]
+    elif ang == 270:
+        coords = [coords[3], coords[0], coords[1], coords[2]]
+        
+# 6. MAPEO GEOMÉTRICO ESTÁNDAR
+    from mathutils import Vector
+    
+    # A. Cortar vértices (Evitar derretido)
+    bmesh.ops.split_edges(bm, edges=face.edges)
+
+    # B. Definir VECTORES FIJOS según hacia dónde mire la cara.
+    # Esto evita que Blender "adivine". Definimos estrictamente qué es Arriba.
+    normal = face.normal
+    center = face.calc_center_median()
+    epsilon = 0.9
+    
+    # --- CONFIGURACIÓN DE CARAS ---
+    
+    if normal.z > epsilon:    # CARA ARRIBA (Piso)
+        ref_up = Vector((0, 1, 0))   
+        ref_right = Vector((1, 0, 0)) # <--- Si sale espejo, cambia a Vector((-1, 0, 0))
+        
+    elif normal.z < -epsilon: # CARA ABAJO (Techo) - LA SOSPECHOSA
+        ref_up = Vector((0, -1, 0))    
+        # AQUÍ HAGO EL CAMBIO ESPECÍFICO PARA LA CARA DE ABAJO
+        # Si antes estaba espejo, probamos invirtiendo X:
+        ref_right = Vector((1, 0, 0)) # <--- Cambié (1,0,0) por (-1,0,0)
+        
+    elif normal.y > epsilon:  # CARA TRASERA (Back)
+        ref_up = Vector((0, 0, 1))
+        ref_right = Vector((-1, 0, 0)) # X negativo suele ser correcto para Back
+        
+    elif normal.y < -epsilon: # CARA FRONTAL (Front)
+        ref_up = Vector((0, 0, 1))
+        ref_right = Vector((1, 0, 0))
+        
+    elif normal.x > epsilon:  # CARA DERECHA (Right)
+        ref_up = Vector((0, 0, 1))
+        ref_right = Vector((0, 1, 0)) # <--- Si la derecha sale espejo, pon (0, -1, 0)
+        
+    elif normal.x < -epsilon: # CARA IZQUIERDA (Left)
+        ref_up = Vector((0, 0, 1))
+        ref_right = Vector((0, -1, 0)) # Y negativo suele ser correcto para Left
+        
+    else: 
+        ref_up = Vector((0, 0, 1))
+        ref_right = ref_up.cross(normal)
+
+    # --- ASIGNACIÓN NEUTRA (NO TOCAR ESTO) ---
+    # Dejamos esto fijo: Izquierda es Izquierda, Derecha es Derecha.
+    # Cualquier corrección hazla arriba en los vectores.
+    
+    for loop in face.loops:
+        vert_vec = loop.vert.co - center
+        dx = vert_vec.dot(ref_right)
+        dy = vert_vec.dot(ref_up)
+        
+        # Mapeo Directo (Estándar)
+        if dx < 0 and dy > 0:   loop[uv_layer].uv = coords[0] # TL
+        elif dx > 0 and dy > 0: loop[uv_layer].uv = coords[1] # TR
+        elif dx > 0 and dy < 0: loop[uv_layer].uv = coords[2] # BR
+        elif dx < 0 and dy < 0: loop[uv_layer].uv = coords[3] # BL
+        else:
+            # Fallback seguro
+            if dx <= 0 and dy >= 0: loop[uv_layer].uv = coords[0]
+            elif dx >= 0 and dy >= 0: loop[uv_layer].uv = coords[1]
+            elif dx >= 0 and dy <= 0: loop[uv_layer].uv = coords[2]
+            elif dx <= 0 and dy <= 0: loop[uv_layer].uv = coords[3]
 
 # ### NUEVO: Se añade el argumento 'stretch' para deformar la malla
 def create_mesh_box_import(name, shape_data, texture_width, texture_height):
@@ -852,7 +952,7 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
     pos = hytale_to_blender_pos(node_data.get("position", {}))
     rot = hytale_to_blender_quat(node_data.get("orientation", {}))
     
-    # --- 1. CREAR EL NODO PRINCIPAL (PADRE/PIVOTE) ---
+    # --- 1. CREAR EL NODO PRINCIPAL (PIVOTE) ---
     node_empty = bpy.data.objects.new(name, None)
     node_empty.empty_display_type = 'PLAIN_AXES'
     node_empty.empty_display_size = 0.2
@@ -862,7 +962,9 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
     node_empty.rotation_mode = 'QUATERNION'
     node_empty.rotation_quaternion = rot
     
-    if parent_obj: node_empty.parent = parent_obj
+    # Emparentar el Empty al padre (si existe)
+    if parent_obj:
+        node_empty.parent = parent_obj
     
     # --- PRE-VERIFICACIÓN DE HIJOS ---
     children_list = node_data.get("children", [])
@@ -874,14 +976,13 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
     
     if shape_type != "none":
         st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
-        
-        # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
+        mesh_obj = None # Inicializamos la variable
+
         if has_children:
-            # 1. Crear copia de shape SIN offset (para que la malla nazca en 0,0,0)
+            # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
             shape_copy = shape_data.copy()
             shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
 
-            # 2. Crear la malla centrada
             if shape_type == 'box':
                 mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
             else:
@@ -890,49 +991,23 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
             mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
             collection.objects.link(mesh_obj)
 
-            # 3. Calcular dónde debe ir el Wrapper
-            # Prioridad A: Offset explícito en JSON
+            # Calcular Offset para el Wrapper
             raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
             target_pos = hytale_to_blender_pos(raw_offset)
             
-            # Prioridad B: Si el offset es 0, verificar si la geometría tiene desplazamiento interno (from/to)
-            # Esto corrige el caso donde 'offset' es 0 pero la caja está definida lejos del centro.
-            if target_pos.length_squared < 0.0001:
-                # Creamos una malla temporal con los datos originales para ver dónde cae
-                temp_mesh = None
-                if shape_type == 'box':
-                    temp_mesh = create_mesh_box_import("Temp", shape_data, texture_width, texture_height)
-                else:
-                    temp_mesh = create_mesh_quad_import("Temp", shape_data, texture_width, texture_height)
-                
-                # Calculamos su centro
-                center_vec = mathutils.Vector((0,0,0))
-                if temp_mesh.vertices:
-                    center_vec = sum((v.co for v in temp_mesh.vertices), mathutils.Vector()) / len(temp_mesh.vertices)
-                
-                # Si está lejos del centro, usamos esa posición como offset del Wrapper
-                if center_vec.length > 0.01:
-                    target_pos = center_vec
-                
-                # Limpiamos
-                bpy.data.meshes.remove(temp_mesh)
-
-            # 4. Crear el Wrapper (Geo) en la posición calculada
+            # Crear el Wrapper (Geo)
             geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
             geo_wrapper.empty_display_type = 'PLAIN_AXES'
-            geo_wrapper.empty_display_size = 0.2
+            geo_wrapper.empty_display_size = 0.1
             collection.objects.link(geo_wrapper)
             
+            # EMPARENTAMIENTO EN CADENA
             geo_wrapper.parent = node_empty
-            geo_wrapper.location = target_pos # Aquí aplicamos la separación Padre <-> Geo
-            geo_wrapper.rotation_mode = 'QUATERNION'
-            geo_wrapper.rotation_quaternion = (1, 0, 0, 0)
-            
-            # 5. Malla dentro del Wrapper (en 0,0,0)
+            geo_wrapper.location = target_pos
             mesh_obj.parent = geo_wrapper
             
         else:
-            # Caso Normal (Sin hijos): Todo directo
+            # Caso Normal: Malla directa al Empty
             if shape_type == 'box':
                 mesh = create_mesh_box_import(name + "_mesh", shape_data, texture_width, texture_height)
             else:
@@ -940,9 +1015,13 @@ def process_node_import(node_data, parent_obj, texture_width, texture_height, co
                 
             mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
             collection.objects.link(mesh_obj)
+            
+            # EMPARENTAMIENTO DIRECTO
             mesh_obj.parent = node_empty
             
-        mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
+        # Aplicar escala (esto ahora se hace después de asegurar que mesh_obj existe)
+        if mesh_obj:
+            mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
 
     # --- 3. PROCESAR HIJOS ---
     for child in children_list:
@@ -1040,14 +1119,14 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
         if not output_path.lower().endswith(".blockymodel"): output_path += ".blockymodel"
         
         # --- LÓGICA DE TEXTURA / RESOLUCIÓN ---
-        tex_w, tex_h = 64, 64 # Valor por defecto seguro
+        tex_w, tex_h = 32, 32 # Valor por defecto seguro
         
         if props.resolution_mode == 'IMAGE':
             if props.target_image:
                 tex_w = props.target_image.size[0]
                 tex_h = props.target_image.size[1]
             else:
-                self.report({'WARNING'}, "Modo Textura activado pero sin imagen. Usando 64x64.")
+                self.report({'WARNING'}, "Modo Textura activado pero sin imagen. Usando 32x32.")
         else:
             # Modo Manual
             tex_w = props.tex_width
@@ -1121,38 +1200,58 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
 
         return {'FINISHED'}
 
+# 1. Definimos las opciones de resolución (Múltiplos de 32)
+# Esto genera una lista de tuplas: ('32', '32', ''), ('64', '64', ''), etc.
+hytale_res_list = [('0', "Automático (JSON)", "Usa los valores del archivo")]
+for i in range(1, 33):
+    val = str(i * 32)
+    hytale_res_list.append((val, val, f"Resolución {val}px"))
+
 class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
     bl_idname = "hytale.import_model"
-    bl_label = "Seleccionar .blockymodel"
+    bl_label = "Importar Modelo Hytale"
     filename_ext = ".blockymodel"
-    filter_glob: bpy.props.StringProperty(default="*.blockymodel;*.json", options={'HIDDEN'})
+    
+    res_w: bpy.props.EnumProperty(
+        name="Ancho UV",
+        items=hytale_res_list,
+        default='0'
+    )
+    res_h: bpy.props.EnumProperty(
+        name="Alto UV",
+        items=hytale_res_list,
+        default='0'
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Resolución UV Manual", icon='UV_DATA')
+        row = box.row(align=True)
+        row.prop(self, "res_w", text="W")
+        row.prop(self, "res_h", text="H")
 
     def execute(self, context):
         try:
-            with open(self.filepath, 'r') as f: data = json.load(f)
+            with open(self.filepath, 'r') as f:
+                data = json.load(f)
         except Exception as e:
             self.report({'ERROR'}, f"Error: {e}")
             return {'CANCELLED'}
-            
+
+        # Lógica de resolución: Prioridad al menú, luego al JSON
+        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 64)
+        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 64)
+
         model_name = os.path.splitext(os.path.basename(self.filepath))[0]
         col = bpy.data.collections.new(model_name)
         context.scene.collection.children.link(col)
-        
-        tex_w = data.get("textureWidth", 64)
-        tex_h = data.get("textureHeight", 64)
-        tex_path = os.path.splitext(self.filepath)[0] + ".png"
-        material = setup_import_material(tex_path, tex_w, tex_h)
-        
-        bpy.ops.object.select_all(action='DESELECT')
+
+        # Iniciar importación recursiva
         for node in data.get("nodes", []):
-            root_obj = process_node_import(node, None, tex_w, tex_h, col)
-            if root_obj:
-                for o in [root_obj] + [c for c in root_obj.children_recursive]:
-                    if o.type == 'MESH':
-                        if not o.data.materials: o.data.materials.append(material)
-                        else: o.data.materials[0] = material
-        
-        self.report({'INFO'}, f"Importado: {model_name}")
+            process_node_import(node, None, tex_w, tex_h, col)
+
+        self.report({'INFO'}, f"Importado con resolución: {tex_w}x{tex_h}")
         return {'FINISHED'}
 
 class OPS_OT_PixelPerfectPack(bpy.types.Operator):
@@ -1178,7 +1277,7 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         
         props = context.scene.hytale_props
         tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 64, 64 
+        if not tex_w: tex_w, tex_h = 64, 64
 
         bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(main_obj.data)
