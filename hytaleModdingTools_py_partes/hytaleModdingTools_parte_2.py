@@ -1,6 +1,179 @@
-# PARTE 2/4 - hytaleModdingTools.py
+# PARTE 2/5 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+            
+        # REGLAS DE ESPEJO (Si hay mirror, el pivote se mueve al final)
+        if visual_mirror_u:
+            json_offset_x += dim_u
+        if visual_mirror_v:
+            json_offset_y += dim_v
+
+        uv_layout[face_name] = {
+            "offset": {"x": int(json_offset_x), "y": int(json_offset_y)},
+            "mirror": {"x": json_mirror_x, "y": json_mirror_y} if (json_mirror_x or json_mirror_y) else False,
+            "angle": int(angle)
+        }
+        
+    return uv_layout
+
+
+def process_node(obj, out_w, out_h, snap_uvs, id_counter):
+    # --- PROCESO TRAS APLICAR INVERSO ---
+    loc, rot, sca = obj.matrix_local.decompose()
+    
+    local_center = mathutils.Vector((0,0,0))
+    final_dims = mathutils.Vector((0,0,0))
+    has_geometry = False
+    
+    # NUEVO: Detección de Stretch
+    # Usamos la escala del objeto como stretch.
+    # Redondeamos a 4 decimales para evitar 1.0000001
+    stretch_x = round(sca.x, 4)
+    stretch_y = round(sca.z, 4) # Blender Z es Hytale Y
+    stretch_z = round(sca.y, 4) # Blender Y es Hytale Z
+    
+    has_stretch = (stretch_x != 1.0 or stretch_y != 1.0 or stretch_z != 1.0)
+    
+    if obj.type == 'MESH' and len(obj.data.vertices) > 0:
+        # [CAMBIO CRÍTICO]: Obtenemos dimensiones BASADAS EN VÉRTICES (Sin escala de objeto)
+        verts = [v.co for v in obj.data.vertices]
+        min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
+        max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
+        
+        # Dimensiones puras de la malla (Raw mesh data)
+        # NO multiplicamos por obj.scale aquí.
+        
+        local_center = (min_v + max_v) / 2.0
+        final_dims = mathutils.Vector((abs(max_v.x - min_v.x), abs(max_v.y - min_v.y), abs(max_v.z - min_v.z)))
+        has_geometry = True
+
+    # --- Normalize name: strip Blender auto-suffixes like ".001", ".002" ---
+    base_name = re.sub(r'\.\d+$', '', obj.name)
+    final_name = base_name
+    if final_name in RESERVED_NAMES:
+        final_name = final_name + "_Geo"
+
+    node_data = {
+        "id": str(id_counter[0]),
+        "name": final_name,
+        "position": blender_to_hytale_pos(loc),      
+        "orientation": blender_to_hytale_quat(rot),  
+        "children": [],
+        "shape": {"type": "none"} 
+    }
+    id_counter[0] += 1
+
+    def get_hytale_size(val, do_snap):
+        # Escala Global fija (16.0) para convertir metros a unidades bloque
+        scaled = val * FIXED_GLOBAL_SCALE
+        if do_snap:
+            return int(round(scaled))
+        return round(scaled, 4)
+
+    if has_geometry:
+        is_plane = (final_dims.x < 0.001) or (final_dims.y < 0.001) or (final_dims.z < 0.001)
+        
+        # El offset de la forma (shape offset) debe tener en cuenta que 
+        # local_center está en espacio sin escalar.
+        # Si aplicamos stretch en Hytale, el offset interno también se estira.
+        # Por lo general, Hytale aplica el stretch desde el centro del pivote.
+        shape_offset = blender_to_hytale_pos(local_center)
+        
+        # Extraemos UVs (La función nueva)
+        texture_layout = extract_uvs(obj, out_w, out_h, snap_to_pixels=snap_uvs)
+
+        hytale_normal = None
+        
+        # Lógica Box vs Quad
+        if is_plane:
+            # (Tu lógica de Quads existente, ajustada a get_hytale_size sin obj.scale)
+            if final_dims.x < 0.001: 
+                hytale_normal = "+X"
+                filtered_size = {
+                    "x": get_hytale_size(final_dims.y, snap_uvs), 
+                    "y": get_hytale_size(final_dims.z, snap_uvs)
+                }
+            elif final_dims.z < 0.001: 
+                hytale_normal = "+Y"
+                filtered_size = {
+                    "x": get_hytale_size(final_dims.x, snap_uvs), 
+                    "y": get_hytale_size(final_dims.y, snap_uvs)
+                }
+            else: 
+                hytale_normal = "+Z"
+                filtered_size = {
+                    "x": get_hytale_size(final_dims.x, snap_uvs), 
+                    "y": get_hytale_size(final_dims.z, snap_uvs)
+                }
+            
+            # Validación de cara para Quads
+            valid_face = None
+            for k, v in texture_layout.items():
+                if v["offset"]["x"] != 0 or v["offset"]["y"] != 0 or v["angle"] != 0:
+                    valid_face = v
+                    break
+            if not valid_face and texture_layout:
+                valid_face = list(texture_layout.values())[0]
+            texture_layout = {"front": valid_face} if valid_face else {}
+            
+        else:
+            # Cuboides
+            full_size = {
+                "x": get_hytale_size(final_dims.x, snap_uvs), 
+                "y": get_hytale_size(final_dims.z, snap_uvs), 
+                "z": get_hytale_size(final_dims.y, snap_uvs)
+            }
+            filtered_size = {k: v for k, v in full_size.items() if v != 0}
+            
+            clean_layout = {}
+            for k, v in texture_layout.items():
+                clean_layout[k] = v
+            texture_layout = clean_layout
+
+        node_data["shape"] = {
+            "type": "quad" if is_plane else "box",
+            "offset": shape_offset,
+            "textureLayout": texture_layout,
+            "unwrapMode": "custom",
+            "settings": {
+                "isPiece": False,
+                "size": filtered_size,
+                "isStaticBox": True
+            },
+            "doubleSided": is_plane,
+            "shadingMode": "flat"
+        }
+        
+        if hytale_normal: 
+            node_data["shape"]["settings"]["normal"] = hytale_normal
+        
+        # [NUEVO] Inserción de propiedad 'stretch'
+        if has_stretch:
+            node_data["shape"]["stretch"] = {
+                "x": stretch_x,
+                "y": stretch_y,
+                "z": stretch_z
+            }
+
+    for child in obj.children:
+        node_data["children"].append(process_node(child, out_w, out_h, snap_uvs, id_counter))
+
+    if not node_data["children"]:
+        del node_data["children"]
+    
+    return node_data
+
+# ==========================================
+#       LÓGICA DE RECONSTRUCCIÓN (ROT)
+# ==========================================
+
+def reconstruct_orientation_from_geometry(obj):
+    """
+    Intenta alinear la geometría interna a los ejes globales y transferir
+    la rotación al objeto (transform). Vital para objetos con 'Apply Transforms'.
+    Fix v24.17: Soporte para Quads usando vectores de arista si falta una 2da cara.
+    """
+    if obj.type != 'MESH': return
     
     mesh = obj.data
     bm = bmesh.new()
@@ -112,7 +285,8 @@ def process_and_decompose_collection(source_col, temp_col):
         if len(children) > 1:
             for child in children:
                 # Crear Wrapper (Empty)
-                wrapper_name = f"GRP_{child.name}"
+                clean_child_name = re.sub(r'\.\d+$', '', child.name)
+                wrapper_name = f"GRP_{clean_child_name}"
                 wrapper = bpy.data.objects.new(wrapper_name, None)
                 temp_col.objects.link(wrapper)
                 
@@ -224,28 +398,41 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     if not bm.loops.layers.uv: bm.loops.layers.uv.new()
     uv_layer = bm.loops.layers.uv.active
     
-    # 1. Datos del JSON
+    # --- 1. DATOS CRUDOS ---
     off_x = data.get("offset", {}).get("x", 0)
     off_y = data.get("offset", {}).get("y", 0)
-    ang = data.get("angle", 0)
+    
+    raw_ang = data.get("angle", 0)
+    try:
+        ang = int(raw_ang) % 360 
+    except:
+        ang = 0
     
     mirror = data.get("mirror", {})
-    # Detectar si es mirror 'true' (bool) o diccionario
-    if isinstance(mirror, bool):
-         mir_x = mirror
-         mir_y = False
-    else:
-         mir_x = mirror.get("x", False)
-         mir_y = mirror.get("y", False)
+    mir_x = mirror if isinstance(mirror, bool) else bool(mirror.get("x", False))
+    mir_y = False if isinstance(mirror, bool) else bool(mirror.get("y", False))
 
-    # 2. DEFINIR EL SIZE UV
-    size_u = fh if ang in [90, 270] else fw
-    size_v = fw if ang in [90, 270] else fh
+    # --- 2. DIMENSIONES ABSOLUTAS ---
+    is_rotated = (ang == 90 or ang == 270)
     
-    # 3. RECUPERAR EL OFFSET BASE
+    # Dimensiones visuales
+    size_u = fh if is_rotated else fw
+    size_v = fw if is_rotated else fh
+    
+    # --- 3. DETECTAR QUÉ EJE DE LA TEXTURA SE INVIERTE ---
+    # Al rotar 90°, el eje X del JSON (Mirror X) afecta visualmente a la altura (V).
+    if ang == 0 or ang == 180:
+        u_is_mirrored = mir_x
+        v_is_mirrored = mir_y
+    else: # 90 o 270
+        u_is_mirrored = mir_y
+        v_is_mirrored = mir_x
+
+    # --- 4. CÁLCULO DEL OFFSET (POSICIÓN) ---
     base_x = off_x
     base_y = off_y
     
+    # Ajuste de punto de anclaje por rotación
     if ang == 90:
         base_x = off_x - size_u
     elif ang == 180:
@@ -254,250 +441,74 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     elif ang == 270:
         base_y = off_y - size_v
 
-    # 4. APLICAR LOGICA DE MIRROR
-    # Si mirror es False, NO entra aquí y NO se hace ningún cambio (se respeta tu lógica original).
-    # Si mirror es True, solo invertimos el tamaño para que vaya "hacia atrás".
+    # Corrección de posición por Espejo:
+    # Si Hytale invierte un eje, el offset define el punto final, no el inicial.
+    # Desplazamos la caja hacia atrás en el eje afectado.
+    if u_is_mirrored:
+        base_x -= size_u
+    if v_is_mirrored:
+        base_y -= size_v
+
+    # --- 5. CÁLCULO DE COORDENADAS ---
+    x_min = base_x
+    x_max = base_x + size_u
+    y_min = base_y
+    y_max = base_y + size_v
     
-    if mir_x:
-        # NO tocamos base_x (el offset 24 ya es correcto como punto de partida)
-        size_u = -size_u  # Solo invertimos la dirección: 20 -> -20.
+    # Aplicamos el espejo GEOMÉTRICAMENTE intercambiando límites.
+    # Esto ya deja la textura "al revés" en el eje correcto antes de rotar.
+    if u_is_mirrored:
+        u_left, u_right = x_max / tex_w, x_min / tex_w
+    else:
+        u_left, u_right = x_min / tex_w, x_max / tex_w
         
-    if mir_y:
-        # NO tocamos base_y
-        size_v = -size_v
-
-    # 5. CALCULAR COORDENADAS FINALES
-    # Ejemplo Mirror: base_x=24, size_u=-20.
-    # u0 = 24. u1 = 24 + (-20) = 4. -> Rango correcto de 24 a 4.
-    
-    u0 = base_x / tex_w
-    u1 = (base_x + size_u) / tex_w
-    
-    v0 = 1.0 - (base_y / tex_h)
-    v1 = 1.0 - ((base_y + size_v) / tex_h)
-
-    coords = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
-
-    if ang == 90:
-        coords = [coords[1], coords[2], coords[3], coords[0]]
-    elif ang == 180:
-        coords = [coords[2], coords[3], coords[0], coords[1]]
-    elif ang == 270:
-        coords = [coords[3], coords[0], coords[1], coords[2]]
+    if v_is_mirrored:
+        v_top = y_max / tex_h
+        v_bottom = y_min / tex_h
+    else:
+        v_top = y_min / tex_h
+        v_bottom = y_max / tex_h
         
-# 6. MAPEO GEOMÉTRICO ESTÁNDAR
+    # Convertir a espacio Blender (1.0 - V)
+    vt = 1.0 - v_top
+    vb = 1.0 - v_bottom
+    
+    # Lista Base (TL, TR, BR, BL)
+    coords = [(u_left, vt), (u_right, vt), (u_right, vb), (u_left, vb)]
+
+    # --- 6. APLICAR ROTACIÓN (WINDING ORDER) ---
+    step = 0
+    if ang == 90: step = 1
+    elif ang == 180: step = 2
+    elif ang == 270: step = 3
+
+    # [CORRECCIÓN FINAL]: Eliminamos el "step += 2".
+    # Al haber calculado bien el "u_is_mirrored" y el "offset" arriba,
+    # la rotación estándar ya coloca cada vértice en su lugar.
+    # El "+2" anterior era lo que estaba causando el error de 180 grados.
+
+    step = step % 4
+    coords = coords[step:] + coords[:step]
+
+    # --- 7. MAPEO GEOMÉTRICO (ESTÁNDAR) ---
     from mathutils import Vector
-    
-    # A. Cortar vértices (Evitar derretido)
     bmesh.ops.split_edges(bm, edges=face.edges)
 
-    # B. Definir VECTORES FIJOS según hacia dónde mire la cara.
-    # Esto evita que Blender "adivine". Definimos estrictamente qué es Arriba.
     normal = face.normal
     center = face.calc_center_median()
     epsilon = 0.9
     
-    # --- CONFIGURACIÓN DE CARAS ---
-    
-    if normal.z > epsilon:    # CARA ARRIBA (Piso)
-        ref_up = Vector((0, 1, 0))   
-        ref_right = Vector((1, 0, 0)) # <--- Si sale espejo, cambia a Vector((-1, 0, 0))
-        
-    elif normal.z < -epsilon: # CARA ABAJO (Techo) - LA SOSPECHOSA
-        ref_up = Vector((0, -1, 0))    
-        # AQUÍ HAGO EL CAMBIO ESPECÍFICO PARA LA CARA DE ABAJO
-        # Si antes estaba espejo, probamos invirtiendo X:
-        ref_right = Vector((1, 0, 0)) # <--- Cambié (1,0,0) por (-1,0,0)
-        
-    elif normal.y > epsilon:  # CARA TRASERA (Back)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((-1, 0, 0)) # X negativo suele ser correcto para Back
-        
-    elif normal.y < -epsilon: # CARA FRONTAL (Front)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((1, 0, 0))
-        
-    elif normal.x > epsilon:  # CARA DERECHA (Right)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((0, 1, 0)) # <--- Si la derecha sale espejo, pon (0, -1, 0)
-        
-    elif normal.x < -epsilon: # CARA IZQUIERDA (Left)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((0, -1, 0)) # Y negativo suele ser correcto para Left
-        
+    if normal.z > epsilon:    # TOP
+        ref_up = Vector((0, 1, 0)); ref_right = Vector((1, 0, 0))   
+    elif normal.z < -epsilon: # BOTTOM
+        ref_up = Vector((0, -1, 0)); ref_right = Vector((1, 0, 0))
+    elif normal.y > epsilon:  # BACK
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((-1, 0, 0))
+    elif normal.y < -epsilon: # FRONT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((1, 0, 0))
+    elif normal.x > epsilon:  # RIGHT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, 1, 0))
+    elif normal.x < -epsilon: # LEFT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, -1, 0))
     else: 
-        ref_up = Vector((0, 0, 1))
-        ref_right = ref_up.cross(normal)
-
-    # --- ASIGNACIÓN NEUTRA (NO TOCAR ESTO) ---
-    # Dejamos esto fijo: Izquierda es Izquierda, Derecha es Derecha.
-    # Cualquier corrección hazla arriba en los vectores.
-    
-    for loop in face.loops:
-        vert_vec = loop.vert.co - center
-        dx = vert_vec.dot(ref_right)
-        dy = vert_vec.dot(ref_up)
-        
-        # Mapeo Directo (Estándar)
-        if dx < 0 and dy > 0:   loop[uv_layer].uv = coords[0] # TL
-        elif dx > 0 and dy > 0: loop[uv_layer].uv = coords[1] # TR
-        elif dx > 0 and dy < 0: loop[uv_layer].uv = coords[2] # BR
-        elif dx < 0 and dy < 0: loop[uv_layer].uv = coords[3] # BL
-        else:
-            # Fallback seguro
-            if dx <= 0 and dy >= 0: loop[uv_layer].uv = coords[0]
-            elif dx >= 0 and dy >= 0: loop[uv_layer].uv = coords[1]
-            elif dx >= 0 and dy <= 0: loop[uv_layer].uv = coords[2]
-            elif dx <= 0 and dy <= 0: loop[uv_layer].uv = coords[3]
-
-# ### NUEVO: Se añade el argumento 'stretch' para deformar la malla
-def create_mesh_box_import(name, shape_data, texture_width, texture_height):
-    settings = shape_data.get("settings", {})
-    size = settings.get("size", {})
-    hx, hy, hz = size.get("x", 0), size.get("y", 0), size.get("z", 0)
-    
-    # 1. Dimensiones Base
-    dx, dy, dz = (hx / 16.0)/2.0, (hz / 16.0)/2.0, (hy / 16.0)/2.0
-    
-    bm = bmesh.new()
-    # Vértices (X, -Z, Y en Blender para mapear Hytale)
-    # 0: BL-Front, 1: BR-Front, 2: BR-Back, 3: BL-Back (Inferiores)
-    # 4: TL-Front, 5: TR-Front, 6: TR-Back, 7: TL-Back (Superiores)
-    v = [bm.verts.new((-dx, -dy, -dz)), bm.verts.new((dx, -dy, -dz)),
-         bm.verts.new((dx, dy, -dz)), bm.verts.new((-dx, dy, -dz)),
-         bm.verts.new((-dx, -dy, dz)), bm.verts.new((dx, -dy, dz)),
-         bm.verts.new((dx, dy, dz)), bm.verts.new((-dx, dy, dz))]
-    
-    # --- CORRECCIÓN DE WINDING (Normales Manuales) ---
-    # Definimos los vértices en sentido anti-horario (CCW) mirando desde fuera.
-    # Esto garantiza que las normales sean correctas sin usar recalc_normals.
-    face_map = {
-        "top":    (v[4], v[5], v[6], v[7]), # Correcto (+Z)
-        "bottom": (v[0], v[3], v[2], v[1]), # CORREGIDO: (Antes era 0,1,2,3 -> Invertido). Ahora (-Z)
-        "front":  (v[0], v[1], v[5], v[4]), # Correcto (-Y)
-        "back":   (v[2], v[3], v[7], v[6]), # Correcto (+Y)
-        "left":   (v[3], v[0], v[4], v[7]), # Correcto (-X)
-        "right":  (v[1], v[2], v[6], v[5])  # Correcto (+X)
-    }
-
-    tex_layout = shape_data.get("textureLayout", {})
-    for f_name, f_verts in face_map.items():
-        if f_name in tex_layout:
-            try:
-                # Al crear la cara con el orden correcto, los índices de loops [0,1,2,3]
-                # son estables y predecibles para la función apply_uvs_smart.
-                f = bm.faces.new(f_verts)
-                
-                # Asignar dimensiones UV
-                if f_name in ['top', 'bottom']: fw, fh = hx, hz
-                elif f_name in ['front', 'back']: fw, fh = hx, hy
-                else: fw, fh = hz, hy
-                
-                apply_uvs_smart(f, bm, tex_layout[f_name], texture_width, texture_height, fw, fh)
-            except ValueError:
-                pass # Evita error si la cara ya existe (raro en cubos)
-            except Exception:
-                pass
-
-    # --- IMPORTANTE: ELIMINADO recalc_face_normals ---
-    # Al quitar esto, evitamos que Blender decida invertir caras arbitrariamente,
-    # lo cual causaba que las UVs se rotaran 180 grados o se desapilaran.
-    # bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-
-    mesh = bpy.data.meshes.new(name)
-    bm.to_mesh(mesh)
-    bm.free()
-    
-    # Aplicar offset
-    obj_off = hytale_to_blender_pos(shape_data.get("offset", {}))
-    for vert in mesh.vertices: vert.co += obj_off
-    return mesh
-    
-def create_mesh_quad_import(name, shape_data, texture_width, texture_height):
-    settings = shape_data.get("settings", {})
-    size = settings.get("size", {})
-    n = settings.get("normal", "+Y")
-    
-    # Tamaño base 1:1 con el archivo
-    dx = (size.get('x', 16) / 16.0) / 2.0
-    dy = (size.get('y', 16) / 16.0) / 2.0
-    
-    bm = bmesh.new()
-    v_pos = []
-    if n == "+Y": v_pos = [(-dx, -dy, 0), (dx, -dy, 0), (dx, dy, 0), (-dx, dy, 0)]
-    elif n == "-Y": v_pos = [(-dx, dy, 0), (dx, dy, 0), (dx, -dy, 0), (-dx, -dy, 0)]
-    elif n == "+Z": v_pos = [(-dx, 0, -dy), (dx, 0, -dy), (dx, 0, dy), (-dx, 0, dy)]
-    elif n == "-Z": v_pos = [(dx, 0, -dy), (-dx, 0, -dy), (-dx, 0, dy), (dx, 0, dy)]
-    elif n == "+X": v_pos = [(0, -dx, -dy), (0, dx, -dy), (0, dx, dy), (0, -dx, dy)]
-    else: v_pos = [(0, dx, -dy), (0, -dx, -dy), (0, -dx, dy), (0, dx, dy)]
-            
-    try:
-        v_objs = [bm.verts.new(p) for p in v_pos]
-        f = bm.faces.new(v_objs)
-        tex_layout = shape_data.get("textureLayout", {})
-        f_name = list(tex_layout.keys())[0] if tex_layout else "front"
-        apply_uvs_smart(f, bm, tex_layout.get(f_name, {}), texture_width, texture_height, size['x'], size['y'])
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    except: pass
-
-    mesh = bpy.data.meshes.new(name)
-    bm.to_mesh(mesh)
-    bm.free()
-    
-    off_h = hytale_to_blender_pos(shape_data.get("offset", {}))
-    for v in mesh.vertices: v.co += off_h
-    return mesh
-
-def process_node_import(node_data, parent_obj, texture_width, texture_height, collection):
-    name = node_data.get("name", "Node")
-    pos = hytale_to_blender_pos(node_data.get("position", {}))
-    rot = hytale_to_blender_quat(node_data.get("orientation", {}))
-    
-    # --- 1. CREAR EL NODO PRINCIPAL (PIVOTE) ---
-    node_empty = bpy.data.objects.new(name, None)
-    node_empty.empty_display_type = 'PLAIN_AXES'
-    node_empty.empty_display_size = 0.2
-    collection.objects.link(node_empty)
-    
-    node_empty.location = pos
-    node_empty.rotation_mode = 'QUATERNION'
-    node_empty.rotation_quaternion = rot
-    
-    # Emparentar el Empty al padre (si existe)
-    if parent_obj:
-        node_empty.parent = parent_obj
-    
-    # --- PRE-VERIFICACIÓN DE HIJOS ---
-    children_list = node_data.get("children", [])
-    has_children = len(children_list) > 0
-
-    # --- 2. CREAR LA FORMA (MESH) ---
-    shape_data = node_data.get("shape", {})
-    shape_type = shape_data.get("type", "none")
-    
-    if shape_type != "none":
-        st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
-        mesh_obj = None # Inicializamos la variable
-
-        if has_children:
-            # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
-            shape_copy = shape_data.copy()
-            shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
-
-            if shape_type == 'box':
-                mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            else:
-                mesh = create_mesh_quad_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            
-            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
-            collection.objects.link(mesh_obj)
-
-            # Calcular Offset para el Wrapper
-            raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
-            target_pos = hytale_to_blender_pos(raw_offset)
-            
-            # Crear el Wrapper (Geo)
-            geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
-            geo_wrapper.empty_display_type = 'PLAIN_AXES'
-            geo_wrapper.empty_display_size = 0.1
-            collection.objects.link(geo_wrapper)
+        ref_up = Vector((0, 0, 1)); ref_right = ref_up.cross(normal)

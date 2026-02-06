@@ -1,6 +1,177 @@
-# PARTE 3/4 - hytaleModdingTools.py
+# PARTE 3/5 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+
+    for loop in face.loops:
+        vert_vec = loop.vert.co - center
+        dx = vert_vec.dot(ref_right)
+        dy = vert_vec.dot(ref_up)
+        
+        idx = 0
+        if dx < 0 and dy > 0:   idx = 0 
+        elif dx > 0 and dy > 0: idx = 1 
+        elif dx > 0 and dy < 0: idx = 2 
+        elif dx < 0 and dy < 0: idx = 3 
+        else: 
+            if dx <= 0 and dy >= 0: idx = 0
+            elif dx >= 0 and dy >= 0: idx = 1
+            elif dx >= 0 and dy <= 0: idx = 2
+            elif dx <= 0 and dy <= 0: idx = 3
+            
+        loop[uv_layer].uv = coords[idx]
+
+# ### NUEVO: Se añade el argumento 'stretch' para deformar la malla
+def create_mesh_box_import(name, shape_data, texture_width, texture_height):
+    settings = shape_data.get("settings", {})
+    size = settings.get("size", {})
+    hx, hy, hz = size.get("x", 0), size.get("y", 0), size.get("z", 0)
+    
+    # 1. Dimensiones Base
+    dx, dy, dz = (hx / 16.0)/2.0, (hz / 16.0)/2.0, (hy / 16.0)/2.0
+    
+    bm = bmesh.new()
+    # Vértices (X, -Z, Y en Blender para mapear Hytale)
+    # 0: BL-Front, 1: BR-Front, 2: BR-Back, 3: BL-Back (Inferiores)
+    # 4: TL-Front, 5: TR-Front, 6: TR-Back, 7: TL-Back (Superiores)
+    v = [bm.verts.new((-dx, -dy, -dz)), bm.verts.new((dx, -dy, -dz)),
+         bm.verts.new((dx, dy, -dz)), bm.verts.new((-dx, dy, -dz)),
+         bm.verts.new((-dx, -dy, dz)), bm.verts.new((dx, -dy, dz)),
+         bm.verts.new((dx, dy, dz)), bm.verts.new((-dx, dy, dz))]
+    
+    # --- CORRECCIÓN DE WINDING (Normales Manuales) ---
+    # Definimos los vértices en sentido anti-horario (CCW) mirando desde fuera.
+    # Esto garantiza que las normales sean correctas sin usar recalc_normals.
+    face_map = {
+        "top":    (v[4], v[5], v[6], v[7]), # Correcto (+Z)
+        "bottom": (v[0], v[3], v[2], v[1]), # CORREGIDO: (Antes era 0,1,2,3 -> Invertido). Ahora (-Z)
+        "front":  (v[0], v[1], v[5], v[4]), # Correcto (-Y)
+        "back":   (v[2], v[3], v[7], v[6]), # Correcto (+Y)
+        "left":   (v[3], v[0], v[4], v[7]), # Correcto (-X)
+        "right":  (v[1], v[2], v[6], v[5])  # Correcto (+X)
+    }
+
+    tex_layout = shape_data.get("textureLayout", {})
+    for f_name, f_verts in face_map.items():
+        if f_name in tex_layout:
+            try:
+                # Al crear la cara con el orden correcto, los índices de loops [0,1,2,3]
+                # son estables y predecibles para la función apply_uvs_smart.
+                f = bm.faces.new(f_verts)
+                
+                # Asignar dimensiones UV
+                if f_name in ['top', 'bottom']: fw, fh = hx, hz
+                elif f_name in ['front', 'back']: fw, fh = hx, hy
+                else: fw, fh = hz, hy
+                
+                apply_uvs_smart(f, bm, tex_layout[f_name], texture_width, texture_height, fw, fh)
+            except ValueError:
+                pass # Evita error si la cara ya existe (raro en cubos)
+            except Exception:
+                pass
+
+    # --- IMPORTANTE: ELIMINADO recalc_face_normals ---
+    # Al quitar esto, evitamos que Blender decida invertir caras arbitrariamente,
+    # lo cual causaba que las UVs se rotaran 180 grados o se desapilaran.
+    # bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    mesh = bpy.data.meshes.new(name)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bm.to_mesh(mesh)
+    bm.free()
+    
+    # Aplicar offset
+    obj_off = hytale_to_blender_pos(shape_data.get("offset", {}))
+    for vert in mesh.vertices: vert.co += obj_off
+    return mesh
+    
+def create_mesh_quad_import(name, shape_data, texture_width, texture_height):
+    settings = shape_data.get("settings", {})
+    size = settings.get("size", {})
+    n = settings.get("normal", "+Y")
+    
+    # Tamaño base 1:1 con el archivo
+    dx = (size.get('x', 16) / 16.0) / 2.0
+    dy = (size.get('y', 16) / 16.0) / 2.0
+    
+    bm = bmesh.new()
+    v_pos = []
+    if n == "+Y": v_pos = [(-dx, -dy, 0), (dx, -dy, 0), (dx, dy, 0), (-dx, dy, 0)]
+    elif n == "-Y": v_pos = [(-dx, dy, 0), (dx, dy, 0), (dx, -dy, 0), (-dx, -dy, 0)]
+    elif n == "+Z": v_pos = [(-dx, 0, -dy), (dx, 0, -dy), (dx, 0, dy), (-dx, 0, dy)]
+    elif n == "-Z": v_pos = [(dx, 0, -dy), (-dx, 0, -dy), (-dx, 0, dy), (dx, 0, dy)]
+    elif n == "+X": v_pos = [(0, -dx, -dy), (0, dx, -dy), (0, dx, dy), (0, -dx, dy)]
+    else: v_pos = [(0, dx, -dy), (0, -dx, -dy), (0, -dx, dy), (0, dx, dy)]
+            
+    try:
+        v_objs = [bm.verts.new(p) for p in v_pos]
+        f = bm.faces.new(v_objs)
+        tex_layout = shape_data.get("textureLayout", {})
+        f_name = list(tex_layout.keys())[0] if tex_layout else "front"
+        apply_uvs_smart(f, bm, tex_layout.get(f_name, {}), texture_width, texture_height, size['x'], size['y'])
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    except: pass
+
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+    
+    off_h = hytale_to_blender_pos(shape_data.get("offset", {}))
+    for v in mesh.vertices: v.co += off_h
+    return mesh
+
+def process_node_import(node_data, parent_obj, texture_width, texture_height, collection):
+    name = node_data.get("name", "Node")
+    pos = hytale_to_blender_pos(node_data.get("position", {}))
+    rot = hytale_to_blender_quat(node_data.get("orientation", {}))
+    
+    # --- 1. CREAR EL NODO PRINCIPAL (PIVOTE) ---
+    node_empty = bpy.data.objects.new(name, None)
+    node_empty.empty_display_type = 'PLAIN_AXES'
+    node_empty.empty_display_size = 0.2
+    collection.objects.link(node_empty)
+    
+    node_empty.location = pos
+    node_empty.rotation_mode = 'QUATERNION'
+    node_empty.rotation_quaternion = rot
+    
+    # Emparentar el Empty al padre (si existe)
+    if parent_obj:
+        node_empty.parent = parent_obj
+    
+    # --- PRE-VERIFICACIÓN DE HIJOS ---
+    children_list = node_data.get("children", [])
+    has_children = len(children_list) > 0
+
+    # --- 2. CREAR LA FORMA (MESH) ---
+    shape_data = node_data.get("shape", {})
+    shape_type = shape_data.get("type", "none")
+    
+    if shape_type != "none":
+        st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
+        mesh_obj = None # Inicializamos la variable
+
+        if has_children:
+            # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
+            shape_copy = shape_data.copy()
+            shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
+
+            if shape_type == 'box':
+                mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
+            else:
+                mesh = create_mesh_quad_import(name + "_mesh", shape_copy, texture_width, texture_height)
+            
+            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
+            collection.objects.link(mesh_obj)
+
+            # Calcular Offset para el Wrapper
+            raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
+            target_pos = hytale_to_blender_pos(raw_offset)
+            
+            # Crear el Wrapper (Geo)
+            geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
+            geo_wrapper.empty_display_type = 'PLAIN_AXES'
+            geo_wrapper.empty_display_size = 0.1
+            collection.objects.link(geo_wrapper)
             
             # EMPARENTAMIENTO EN CADENA
             geo_wrapper.parent = node_empty
@@ -153,34 +324,74 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            # --- BLOQUE OPTIMIZADO: Formato Compacto ---
-            # 1. Generamos JSON con indentación vertical limpia
-            json_str = json.dumps(final_json, indent=1)
-            
-            # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
-            # Convierte:
-            # {
-            #  "x": 10,
-            #  "y": 5,
-            #  "z": 0
-            # }
-            # a: {"x": 10, "y": 5, "z": 0}
+            # --- BLOQUE OPTIMIZADO: Formato Compacto (Opción B) ---
+            def write_blockymodel_mixed_to_string(data, indent=1,
+                                                  inline_keys=('vertices','uvs','data','indices','colors'),
+                                                  min_items_to_inline=1):
+                """
+                Serializa `data` a JSON con indentación reducida (indent),
+                y luego compacta arrays de ciertas keys a una sola línea para ahorrar espacio.
+                Devuelve el string final.
+                """
+                # 1) Serializamos con indent simple
+                json_str = json.dumps(data, indent=indent, ensure_ascii=False)
+                
+                # 2) Compactar arrays de keys objetivo (regex sobre el JSON formateado)
+                for key in inline_keys:
+                    pattern = r'("'+re.escape(key)+r'"\s*:\s*)\[\s*(.*?)\s*\]'
+                    def repl(m):
+                        prefix = m.group(1)
+                        inner = m.group(2)
+                        approx_elements = inner.count(',') + 1 if inner.strip() != '' else 0
+                        if approx_elements < min_items_to_inline:
+                            return m.group(0)
+                        compact = re.sub(r'\s+', ' ', inner)
+                        compact = re.sub(r'\s*,\s*', ',', compact)
+                        compact = re.sub(r'\s*:\s*', ':', compact)
+                        return prefix + '[' + compact.strip() + ']'
+                    json_str = re.sub(pattern, repl, json_str, flags=re.DOTALL)
+
+                return json_str
+
+            # Generar JSON parcialmente compactado en memoria
+            json_str = write_blockymodel_mixed_to_string(final_json, indent=1,
+                                                         inline_keys=('vertices','uvs','data','indices','colors'),
+                                                         min_items_to_inline=1)
+
+            # 3) Extra: Colapsar vectores/quat en una sola línea (más robusto con floats y exponentes)
+            float_pat = r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+            # Vector {x,y,z}
             json_str = re.sub(
-                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
-                r'{"x": \1, "y": \2, "z": \3}', 
-                json_str, 
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*,\s*"z"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2, "z": \3}',
+                json_str,
+                flags=re.DOTALL
+            )
+            # Quaternion {x,y,z,w}
+            json_str = re.sub(
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*,\s*"z"\s*:\s*' + float_pat + r'\s*,\s*"w"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2, "z": \3, "w": \4}',
+                json_str,
+                flags=re.DOTALL
+            )
+
+            # 4) (Opcional) Compactar pequeños objetos de 2 componentes {"u", "v"} -> {"u":..., "v":...}
+            json_str = re.sub(
+                r'\{\s*"u"\s*:\s*' + float_pat + r'\s*,\s*"v"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"u": \1, "v": \2}',
+                json_str,
                 flags=re.DOTALL
             )
             
-            # 3. OPTIMIZACIÓN: Colapsar Cuaterniones {x,y,z,w}
+            # --- Compactar objetos 2-componentes {x, y} (p.ej. offset) ---
             json_str = re.sub(
-                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+),\s*"w":\s*([\d\.-]+)\s*\}', 
-                r'{"x": \1, "y": \2, "z": \3, "w": \4}', 
-                json_str, 
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2}',
+                json_str,
                 flags=re.DOTALL
             )
-            
-            # 4. Escritura
+
+            # 5) Escritura final
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
                 
@@ -200,6 +411,7 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 bpy.data.collections.remove(temp_col)
 
         return {'FINISHED'}
+
 
 # 1. Definimos las opciones de resolución (Múltiplos de 32)
 # Esto genera una lista de tuplas: ('32', '32', ''), ('64', '64', ''), etc.
@@ -241,8 +453,8 @@ class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
         # Lógica de resolución: Prioridad al menú, luego al JSON
-        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 64)
-        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 64)
+        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 32)
+        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 32)
 
         model_name = os.path.splitext(os.path.basename(self.filepath))[0]
         col = bpy.data.collections.new(model_name)
@@ -278,7 +490,7 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         
         props = context.scene.hytale_props
         tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 64, 64
+        if not tex_w: tex_w, tex_h = 32, 32
 
         bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(main_obj.data)
@@ -291,218 +503,3 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
                 bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001, correct_aspect=True)
             except:
                 bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-
-        # --- PASO 2: ALINEACIÓN (API Moderna) ---
-        area_uv = next((a for a in context.screen.areas if a.type == 'IMAGE_EDITOR'), None)
-        if area_uv:
-            with context.temp_override(area=area_uv):
-                try: 
-                    bpy.ops.uv.select_all(action='SELECT')
-                    bpy.ops.uv.align_rotation(method='AUTO', correct_aspect=True)
-                except: pass
-        
-        bmesh.update_edit_mesh(main_obj.data)
-
-        # --- PASO 3: ESCALADO PIXEL PERFECT ---
-        all_loops = [l for f in bm.faces for l in f.loops]
-        if not all_loops:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            return {'FINISHED'}
-
-        min_u_global = min(l[uv_layer].uv.x for l in all_loops)
-        max_u_global = max(l[uv_layer].uv.x for l in all_loops)
-        min_v_global = min(l[uv_layer].uv.y for l in all_loops)
-        max_v_global = max(l[uv_layer].uv.y for l in all_loops)
-
-        dominant_face = max(bm.faces, key=lambda f: f.calc_area())
-        v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = mathutils.Vector(((v1.x-v0.x)*main_obj.scale.x, (v1.y-v0.y)*main_obj.scale.y, (v1.z-v0.z)*main_obj.scale.z)).length
-        h_3d = mathutils.Vector(((v3.x-v0.x)*main_obj.scale.x, (v3.y-v0.y)*main_obj.scale.y, (v3.z-v0.z)*main_obj.scale.z)).length
-
-        uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
-        curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
-        curr_h_uv = max(0.0001, max(u.y for u in uvs_dom) - min(u.y for u in uvs_dom))
-
-        scale_u = (w_3d * 16.0 / tex_w) / curr_w_uv
-        scale_v = (h_3d * 16.0 / tex_h) / curr_h_uv
-
-        pivot = mathutils.Vector(((min_u_global + max_u_global) / 2.0, (min_v_global + max_v_global) / 2.0))
-        for f in bm.faces:
-            for l in f.loops:
-                l[uv_layer].uv.x = pivot.x + (l[uv_layer].uv.x - pivot.x) * scale_u
-                l[uv_layer].uv.y = pivot.y + (l[uv_layer].uv.y - pivot.y) * scale_v
-                if props.snap_uvs:
-                    l[uv_layer].uv.x = round(l[uv_layer].uv.x * tex_w) / tex_w
-                    l[uv_layer].uv.y = round(l[uv_layer].uv.y * tex_h) / tex_h
-
-        bmesh.update_edit_mesh(main_obj.data)
-
-        # --- PASO 4: AUTO-STACK POR INTERSECCIÓN (OPCIONAL) ---
-        if props.auto_stack:
-            # Funciones internas para detectar islas y dimensiones
-            def get_islands(bm, uv_layer):
-                all_faces = set(bm.faces)
-                islands = []
-                while all_faces:
-                    face = all_faces.pop()
-                    island = {face}
-                    stack = [face]
-                    while stack:
-                        f = stack.pop()
-                        for edge in f.edges:
-                            for neighbor in edge.link_faces:
-                                if neighbor in all_faces:
-                                    is_joined = False
-                                    for l1 in f.loops:
-                                        if l1.edge == edge:
-                                            for l2 in neighbor.loops:
-                                                if l2.edge == edge:
-                                                    if (l1[uv_layer].uv - l2[uv_layer].uv).length < 0.0001:
-                                                        is_joined = True; break
-                                    if is_joined:
-                                        island.add(neighbor); stack.append(neighbor); all_faces.remove(neighbor)
-                    islands.append(island)
-                return islands
-
-            def get_island_stats(island, uv_layer):
-                uvs = [l[uv_layer].uv for f in island for l in f.loops]
-                mi_u = min(u.x for u in uvs); ma_u = max(u.x for u in uvs)
-                mi_v = min(u.y for u in uvs); ma_v = max(u.y for u in uvs)
-                return {
-                    'min_u': mi_u, 'max_u': ma_u, 'min_v': mi_v, 'max_v': ma_v,
-                    'w': round(ma_u - mi_u, 5), 'h': round(ma_v - mi_v, 5),
-                    'min_corner': mathutils.Vector((mi_u, mi_v))
-                }
-
-            bm.faces.ensure_lookup_table()
-            islands = get_islands(bm, uv_layer)
-            stats = [get_island_stats(isl, uv_layer) for isl in islands]
-            
-            for i in range(len(stats)):
-                for j in range(i + 1, len(stats)):
-                    A = stats[i]
-                    B = stats[j]
-                    
-                    # Detección de colisión AABB
-                    overlap = not (A['max_u'] < B['min_u'] or A['min_u'] > B['max_u'] or 
-                                   A['max_v'] < B['min_v'] or A['min_v'] > B['max_v'])
-                    
-                    if overlap:
-                        if abs(A['w'] - B['w']) < 0.001 and abs(A['h'] - B['h']) < 0.001:
-                            diff = A['min_corner'] - B['min_corner']
-                            for f in islands[j]:
-                                for l in f.loops:
-                                    l[uv_layer].uv += diff
-                            
-                            B['min_corner'] += diff
-                            B['min_u'] += diff.x; B['max_u'] += diff.x
-                            B['min_v'] += diff.y; B['max_v'] += diff.y
-
-        # --- AJUSTE AL LIENZO ---
-        bmesh.update_edit_mesh(main_obj.data); curu, curv = [l[uv_layer].uv.x for f in bm.faces for l in f.loops], [l[uv_layer].uv.y for f in bm.faces for l in f.loops]
-        offu, offv = -min(curu) if min(curu) < 0 else (1.0 - max(curu) if max(curu) > 1.0 else 0), -min(curv) if min(curv) < 0 else (1.0 - max(curv) if max(curv) > 1.0 else 0)
-        if offu != 0.0 or offv != 0.0:
-            for face in bm.faces:
-                for loop in face.loops: loop[uv_layer].uv.x += offu; loop[uv_layer].uv.y += offv
-        bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
-        self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
-
-
-def update_target_material(self, context):
-    """
-    Callback: Cuando seleccionas un material, se aplica automáticamente
-    a TODOS los objetos de la colección seleccionada.
-    """
-    mat = self.target_material
-    collection = self.target_collection
-    
-    if not collection or not mat: return
-        
-    for obj in collection.objects:
-        if obj.type == 'MESH':
-            # Asignar el material en la ranura 0 (o crearla)
-            if not obj.data.materials:
-                obj.data.materials.append(mat)
-            else:
-                obj.data.materials[0] = mat
-
-def update_target_texture(self, context):
-    """
-    Callback: Aplica la imagen seleccionada al nodo de textura del 'target_material'.
-    Ya no iteramos objetos, modificamos directamente el material compartido.
-    """
-    target_img = self.target_image
-    mat = self.target_material # Usamos el material global seleccionado
-    
-    if not target_img or not mat: return
-    
-    # --- Configuración de Nodos del Material ---
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    
-    # 1. Buscar o Crear Principled BSDF
-    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    if not bsdf:
-        nodes.clear() # Limpiamos si estaba sucio
-        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 0)
-        out = nodes.new('ShaderNodeOutputMaterial')
-        out.location = (300, 0)
-        links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    
-    # 2. Buscar o Crear Nodo de Imagen
-    tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
-    if not tex_node:
-        tex_node = nodes.new('ShaderNodeTexImage')
-        tex_node.location = (-300, 200)
-    
-    # 3. Asignar Imagen y Configurar
-    tex_node.image = target_img
-    tex_node.interpolation = 'Closest' # Pixel Art style
-    
-    # 4. Conectar
-    if 'Base Color' in bsdf.inputs:
-        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-    if 'Alpha' in bsdf.inputs:
-        links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-        
-    # 5. Configurar Transparencia
-    mat.blend_method = 'CLIP'
-    mat.shadow_method = 'CLIP'
-
-# --- UI Y PANEL ---
-
-class HytaleProperties(bpy.types.PropertyGroup):
-    target_collection: bpy.props.PointerProperty(
-        name="Colección",
-        type=bpy.types.Collection,
-        description="Selecciona la colección del modelo"
-    )
-    
-    # --- NUEVO: Propiedad para el Material ---
-    target_material: bpy.props.PointerProperty(
-        name="Material Base",
-        type=bpy.types.Material,
-        description="Este material se aplicará a todo el modelo",
-        update=update_target_material
-    )
-    
-    # --- SISTEMA DE SELECCIÓN DE TEXTURA ---
-    resolution_mode: bpy.props.EnumProperty(
-        name="Modo de Resolución",
-        description="Elige de dónde obtener el tamaño del mapa UV",
-        items=[
-            ('IMAGE', "Usar Textura (Skin)", "El tamaño se tomará de la imagen seleccionada", 'IMAGE_DATA', 0),
-            ('CUSTOM', "Manual (Sin Textura)", "Escribir el tamaño manualmente", 'EDITMODE_HLT', 1)
-        ],
-        default='IMAGE'
-    )
-    
-    target_image: bpy.props.PointerProperty(
-        name="Textura del Modelo",
-        type=bpy.types.Image,
-        description="Selecciona la imagen/textura que usará este modelo",
-        update=update_target_texture
-    )
-    # ---------------------------------------
