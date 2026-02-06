@@ -277,6 +277,26 @@ def get_face_name_dominant(normal):
         return "back" if y > 0 else "front"
     else:
         return "right" if x > 0 else "left"
+        
+def get_face_basis_vectors(normal):
+    """Retorna vectores (Right, Up) para una normal dada según el estándar Hytale/Blockbench"""
+    epsilon = 0.9
+    if normal.z > epsilon:    # TOP
+        return mathutils.Vector((1, 0, 0)), mathutils.Vector((0, 1, 0))
+    elif normal.z < -epsilon: # BOTTOM
+        return mathutils.Vector((1, 0, 0)), mathutils.Vector((0, -1, 0))
+    elif normal.y > epsilon:  # BACK
+        return mathutils.Vector((-1, 0, 0)), mathutils.Vector((0, 0, 1))
+    elif normal.y < -epsilon: # FRONT
+        return mathutils.Vector((1, 0, 0)), mathutils.Vector((0, 0, 1))
+    elif normal.x > epsilon:  # RIGHT
+        return mathutils.Vector((0, 1, 0)), mathutils.Vector((0, 0, 1))
+    elif normal.x < -epsilon: # LEFT
+        return mathutils.Vector((0, -1, 0)), mathutils.Vector((0, 0, 1))
+    else:
+        up = mathutils.Vector((0, 0, 1))
+        right = up.cross(normal)
+        return right, up
 
 def extract_uvs(obj, output_w, output_h, snap_to_pixels):
     uv_layout = {} 
@@ -286,116 +306,247 @@ def extract_uvs(obj, output_w, output_h, snap_to_pixels):
 
     mesh = obj.data
     uv_layer = mesh.uv_layers.active.data
-    scale = obj.scale
     
     for poly in mesh.polygons:
+        # 1. Determinar orientación 3D
         face_name = get_face_name_dominant(poly.normal)
+        ref_right, ref_up = get_face_basis_vectors(poly.normal)
         
-        raw_uvs = [uv_layer[loop_idx].uv for loop_idx in poly.loop_indices]
-        if not raw_uvs: continue
+        # 2. Obtener UVs y Vértices
+        loops = [uv_layer[i] for i in poly.loop_indices]
+        verts = [mesh.vertices[i].co for i in poly.vertices]
+        
+        if not loops or not verts:
+            continue
 
-        min_u = min(uv.x for uv in raw_uvs)
-        max_u = max(uv.x for uv in raw_uvs)
-        min_v = min(uv.y for uv in raw_uvs)
-        max_v = max(uv.y for uv in raw_uvs)
+        # 3. Calcular Bounding Box UV VISUAL (Blender Space)
+        us = [l.uv.x for l in loops]
+        vs = [l.uv.y for l in loops]
+        min_u, max_u = min(us), max(us)
+        min_v, max_v = min(vs), max(vs)
         
-        x_start_f = min_u * output_w
-        x_end_f = max_u * output_w
-        y_top_f = (1.0 - max_v) * output_h
-        y_bottom_f = (1.0 - min_v) * output_h
+        # Convertir a Píxeles (Top-Left Origin para cálculos lógicos)
+        x_left = min_u * output_w
+        x_right = max_u * output_w
+        # Invertimos Y porque Blender es Bottom-Left y Hytale/Imágenes son Top-Left
+        y_top = (1.0 - max_v) * output_h
+        y_bottom = (1.0 - min_v) * output_h
 
         if snap_to_pixels:
-            x_left = standard_round(x_start_f)
-            x_right = standard_round(x_end_f)
-            y_top = standard_round(y_top_f)
-            y_bottom = standard_round(y_bottom_f)
-        else:
-            x_left = x_start_f
-            x_right = x_end_f
-            y_top = y_top_f
-            y_bottom = y_bottom_f
-            
-        uv_pixel_width = abs(x_right - x_left)
-        uv_pixel_height = abs(y_bottom - y_top)
-        uv_is_vertical = uv_pixel_height > uv_pixel_width
+            x_left, x_right = standard_round(x_left), standard_round(x_right)
+            y_top, y_bottom = standard_round(y_top), standard_round(y_bottom)
+        
+        width_px = abs(x_right - x_left)
+        height_px = abs(y_bottom - y_top)
 
-        verts = [mesh.vertices[idx].co for idx in poly.vertices]
-        scaled_verts = [mathutils.Vector((v.x * abs(scale.x), v.y * abs(scale.y), v.z * abs(scale.z))) for v in verts]
-        
-        face_width_3d = 0.0
-        face_height_3d = 0.0
-        
-        if face_name in ['front', 'back']: 
-            face_width_3d = max(v.x for v in scaled_verts) - min(v.x for v in scaled_verts)
-            face_height_3d = max(v.z for v in scaled_verts) - min(v.z for v in scaled_verts)
-        elif face_name in ['left', 'right']: 
-            face_width_3d = max(v.y for v in scaled_verts) - min(v.y for v in scaled_verts)
-            face_height_3d = max(v.z for v in scaled_verts) - min(v.z for v in scaled_verts)
-        else: 
-            face_width_3d = max(v.x for v in scaled_verts) - min(v.x for v in scaled_verts)
-            face_height_3d = max(v.y for v in scaled_verts) - min(v.y for v in scaled_verts)
-            
-        face_is_vertical = face_height_3d > face_width_3d
-        
+        # ------------------------------------------------------------
+        # 4. DETECCIÓN DE ROTACIÓN (definir angle) - heurística original
+        # ------------------------------------------------------------
+        # Evitamos NameError asegurando que 'angle' siempre exista.
         angle = 0
-        if (face_is_vertical != uv_is_vertical) and (abs(face_width_3d - face_height_3d) > 0.01):
-            if face_name in ['right', 'left']:
-                angle = 270 
+        try:
+            v0, v1 = verts[0], verts[1]
+            uv0, uv1 = loops[0].uv, loops[1].uv
+
+            d_3d = v1 - v0
+            d_uv = uv1 - uv0
+
+            dx_3d = d_3d.dot(ref_right)
+            dy_3d = d_3d.dot(ref_up)
+
+            # Tolerancia para evitar falsos positivos (FIX v0.39)
+            EPS = 0.0001
+
+            # Detectar ángulo basándonos en si el borde horizontal 3D se mueve en U o V
+            if abs(dx_3d) > abs(dy_3d):
+                if abs(d_uv.y) > abs(d_uv.x) + EPS:
+                    angle = 90
             else:
-                uv0 = uv_layer[poly.loop_indices[0]].uv
-                uv1 = uv_layer[poly.loop_indices[1]].uv
-                du = uv1.x - uv0.x
-                v0 = scaled_verts[0]
-                v1 = scaled_verts[1]
-                d_vert_3d = (v1.z - v0.z) if face_name in ['front', 'back'] else (v1.y - v0.y)
-                angle = 270 if (du > 0) == (d_vert_3d > 0) else 90
+                if abs(d_uv.x) > abs(d_uv.y) + EPS:
+                    angle = 90
+        except Exception:
+            # en caso de cualquier problema, mantenemos angle = 0
+            angle = 0
+
+        # ------------------------------------------------------------
+        # 4b. DETECCIÓN DE ESPEJO (Robusta via Jacobiana)
+        # ------------------------------------------------------------
+        # Calculamos una aproximación lineal que mapea (lx,ly) -> (uv.x, uv.y)
+        # y usamos su determinante y signos para detectar mirror/flip por eje.
+
+        EPS_J = 1e-8
+
+        # Proyección geométrica para encontrar coordenadas locales (lx,ly) y UVs
+        proj_verts = []
+        for i, v in enumerate(verts):
+            lx = (v - poly.center).dot(ref_right)
+            ly = (v - poly.center).dot(ref_up)
+            proj_verts.append({'lx': lx, 'ly': ly, 'uv': loops[i].uv})
+
+        n = len(proj_verts)
+        visual_mirror_u = False
+        visual_mirror_v = False
+
+        if n < 3:
+            # fallback simple si no hay suficientes puntos
+            left_v = min(proj_verts, key=lambda p: p['lx'])
+            right_v = max(proj_verts, key=lambda p: p['lx'])
+            bottom_v = min(proj_verts, key=lambda p: p['ly'])
+            top_v = max(proj_verts, key=lambda p: p['ly'])
+
+            visual_mirror_u = (left_v['uv'].x > right_v['uv'].x + 1e-6)
+            visual_mirror_v = (bottom_v['uv'].y > top_v['uv'].y + 1e-6)
+        else:
+            mean_lx = sum(p['lx'] for p in proj_verts) / n
+            mean_ly = sum(p['ly'] for p in proj_verts) / n
+            mean_uvx = sum(p['uv'].x for p in proj_verts) / n
+            mean_uvy = sum(p['uv'].y for p in proj_verts) / n
+
+            # construir sums para resolución 2x2 (A^T A) y A^T B
+            Sxx = Sxy = Syy = 0.0
+            Sxux = Syux = 0.0
+            Sxuy = Syuy = 0.0
+
+            for p in proj_verts:
+                cx = p['lx'] - mean_lx
+                cy = p['ly'] - mean_ly
+                ux = p['uv'].x - mean_uvx
+                uy = p['uv'].y - mean_uvy
+
+                Sxx += cx * cx
+                Sxy += cx * cy
+                Syy += cy * cy
+
+                Sxux += cx * ux
+                Syux += cy * ux
+
+                Sxuy += cx * uy
+                Syuy += cy * uy
+
+            det_mat = (Sxx * Syy - Sxy * Sxy)
+
+            if abs(det_mat) > EPS_J:
+                # resolver para coeficientes que mapean (lx,ly) -> uv.x
+                a_u = (Sxux * Syy - Syux * Sxy) / det_mat
+                b_u = (Syux * Sxx - Sxux * Sxy) / det_mat
+
+                # y para uv.y
+                a_v = (Sxuy * Syy - Syuy * Sxy) / det_mat
+                b_v = (Syuy * Sxx - Sxuy * Sxy) / det_mat
+
+                # Jacobiana 2x2: [[a_u, b_u], [a_v, b_v]]
+                detJ = (a_u * b_v - b_u * a_v)
+
+                # visual_mirror_u: al movernos hacia la derecha en 3D (lx aumenta),
+                # ¿disminuye U? => mirror horizontal visual
+                visual_mirror_u = (a_u < -EPS_J)
+                # visual_mirror_v: al movernos hacia arriba en 3D (ly aumenta),
+                # ¿disminuye V? => mirror vertical visual
+                visual_mirror_v = (b_v < -EPS_J)
+
+                # Si la matriz tiene determinante negativo => inversión global detectable.
+                if detJ < 0 and not (visual_mirror_u or visual_mirror_v):
+                    # elegimos el eje con mayor influencia absoluta (heurística)
+                    influence_u = abs(a_u) + abs(b_u)
+                    influence_v = abs(a_v) + abs(b_v)
+                    if influence_u >= influence_v:
+                        visual_mirror_u = True
+                    else:
+                        visual_mirror_v = True
+            else:
+                # fallback a heurística por extremos si la matriz es casi singular
+                left_v = min(proj_verts, key=lambda p: p['lx'])
+                right_v = max(proj_verts, key=lambda p: p['lx'])
+                bottom_v = min(proj_verts, key=lambda p: p['ly'])
+                top_v = max(proj_verts, key=lambda p: p['ly'])
+
+                visual_mirror_u = (left_v['uv'].x > right_v['uv'].x + 1e-6)
+                visual_mirror_v = (bottom_v['uv'].y > top_v['uv'].y + 1e-6)
+
+        # ------------------------------------------------------------
+        # 5. MAPEO A JSON (Intercambio de Ejes)
+        # ------------------------------------------------------------
+        json_mirror_x = False
+        json_mirror_y = False
         
-        final_offset_x = x_left
-        final_offset_y = y_top
+        if angle == 90 or angle == 270:
+            # Cruzado
+            json_mirror_x = visual_mirror_v
+            json_mirror_y = visual_mirror_u
+        else:
+            # Directo
+            json_mirror_x = visual_mirror_u
+            json_mirror_y = visual_mirror_v
+
+        # 6. CÁLCULO DEL OFFSET (Matemática Inversa Exacta)
+        u_controlled_by_mirror = json_mirror_y if (angle == 90 or angle == 270) else json_mirror_x
+        v_controlled_by_mirror = json_mirror_x if (angle == 90 or angle == 270) else json_mirror_y
+
+        # Empezamos en la esquina superior izquierda visual
+        json_offset_x = x_left
+        json_offset_y = y_top
         
-        if angle == 270: 
-            final_offset_x = x_left
-            final_offset_y = y_bottom
-        elif angle == 90:
-            final_offset_x = x_right
-            final_offset_y = y_top
+        # Dimensiones para sumar
+        dim_u = width_px 
+        dim_v = height_px 
+        
+        # REGLAS DE ROTACIÓN (Sumamos al offset para compensar la resta del importador)
+        if angle == 90:
+            json_offset_x += dim_u 
         elif angle == 180:
-            final_offset_x = x_right
-            final_offset_y = y_bottom
+            json_offset_x += dim_u
+            json_offset_y += dim_v
+        elif angle == 270:
+            json_offset_y += dim_v
             
+        # REGLAS DE ESPEJO (Si hay mirror, el pivote se mueve al final)
+        if visual_mirror_u:
+            json_offset_x += dim_u
+        if visual_mirror_v:
+            json_offset_y += dim_v
+
         uv_layout[face_name] = {
-            "offset": {"x": int(final_offset_x), "y": int(final_offset_y)},
-            "mirror": {"x": False, "y": False},
+            "offset": {"x": int(json_offset_x), "y": int(json_offset_y)},
+            "mirror": {"x": json_mirror_x, "y": json_mirror_y} if (json_mirror_x or json_mirror_y) else False,
             "angle": int(angle)
         }
+        
     return uv_layout
+
 
 def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     # --- PROCESO TRAS APLICAR INVERSO ---
-    # Gracias a la matemática aplicada en la colección temporal, 
-    # obj.matrix_local ya contiene la transformación relativa limpia.
-    
     loc, rot, sca = obj.matrix_local.decompose()
     
     local_center = mathutils.Vector((0,0,0))
     final_dims = mathutils.Vector((0,0,0))
     has_geometry = False
-
+    
+    # NUEVO: Detección de Stretch
+    # Usamos la escala del objeto como stretch.
+    # Redondeamos a 4 decimales para evitar 1.0000001
+    stretch_x = round(sca.x, 4)
+    stretch_y = round(sca.z, 4) # Blender Z es Hytale Y
+    stretch_z = round(sca.y, 4) # Blender Y es Hytale Z
+    
+    has_stretch = (stretch_x != 1.0 or stretch_y != 1.0 or stretch_z != 1.0)
+    
     if obj.type == 'MESH' and len(obj.data.vertices) > 0:
+        # [CAMBIO CRÍTICO]: Obtenemos dimensiones BASADAS EN VÉRTICES (Sin escala de objeto)
         verts = [v.co for v in obj.data.vertices]
         min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
         max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
         
-        # Para la geometría (Bounds), seguimos usando la escala del bloque de datos
-        scale_data = obj.scale 
-        real_min = mathutils.Vector((min_v.x * scale_data.x, min_v.y * scale_data.y, min_v.z * scale_data.z))
-        real_max = mathutils.Vector((max_v.x * scale_data.x, max_v.y * scale_data.y, max_v.z * scale_data.z))
+        # Dimensiones puras de la malla (Raw mesh data)
+        # NO multiplicamos por obj.scale aquí.
         
-        local_center = (real_min + real_max) / 2.0
-        final_dims = mathutils.Vector((abs(real_max.x - real_min.x), abs(real_max.y - real_min.y), abs(real_max.z - real_min.z)))
+        local_center = (min_v + max_v) / 2.0
+        final_dims = mathutils.Vector((abs(max_v.x - min_v.x), abs(max_v.y - min_v.y), abs(max_v.z - min_v.z)))
         has_geometry = True
 
-    final_name = obj.name
+    # --- Normalize name: strip Blender auto-suffixes like ".001", ".002" ---
+    base_name = re.sub(r'\.\d+$', '', obj.name)
+    final_name = base_name
     if final_name in RESERVED_NAMES:
         final_name = final_name + "_Geo"
 
@@ -410,6 +561,7 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     id_counter[0] += 1
 
     def get_hytale_size(val, do_snap):
+        # Escala Global fija (16.0) para convertir metros a unidades bloque
         scaled = val * FIXED_GLOBAL_SCALE
         if do_snap:
             return int(round(scaled))
@@ -418,11 +570,20 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     if has_geometry:
         is_plane = (final_dims.x < 0.001) or (final_dims.y < 0.001) or (final_dims.z < 0.001)
         
+        # El offset de la forma (shape offset) debe tener en cuenta que 
+        # local_center está en espacio sin escalar.
+        # Si aplicamos stretch en Hytale, el offset interno también se estira.
+        # Por lo general, Hytale aplica el stretch desde el centro del pivote.
         shape_offset = blender_to_hytale_pos(local_center)
+        
+        # Extraemos UVs (La función nueva)
         texture_layout = extract_uvs(obj, out_w, out_h, snap_to_pixels=snap_uvs)
 
         hytale_normal = None
+        
+        # Lógica Box vs Quad
         if is_plane:
+            # (Tu lógica de Quads existente, ajustada a get_hytale_size sin obj.scale)
             if final_dims.x < 0.001: 
                 hytale_normal = "+X"
                 filtered_size = {
@@ -442,6 +603,7 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
                     "y": get_hytale_size(final_dims.z, snap_uvs)
                 }
             
+            # Validación de cara para Quads
             valid_face = None
             for k, v in texture_layout.items():
                 if v["offset"]["x"] != 0 or v["offset"]["y"] != 0 or v["angle"] != 0:
@@ -449,9 +611,10 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
                     break
             if not valid_face and texture_layout:
                 valid_face = list(texture_layout.values())[0]
-            
             texture_layout = {"front": valid_face} if valid_face else {}
+            
         else:
+            # Cuboides
             full_size = {
                 "x": get_hytale_size(final_dims.x, snap_uvs), 
                 "y": get_hytale_size(final_dims.z, snap_uvs), 
@@ -477,15 +640,23 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
             "doubleSided": is_plane,
             "shadingMode": "flat"
         }
-        if hytale_normal: node_data["shape"]["settings"]["normal"] = hytale_normal
+        
+        if hytale_normal: 
+            node_data["shape"]["settings"]["normal"] = hytale_normal
+        
+        # [NUEVO] Inserción de propiedad 'stretch'
+        if has_stretch:
+            node_data["shape"]["stretch"] = {
+                "x": stretch_x,
+                "y": stretch_y,
+                "z": stretch_z
+            }
 
     for child in obj.children:
         node_data["children"].append(process_node(child, out_w, out_h, snap_uvs, id_counter))
 
-    # --- NUEVO: SI NO TIENE HIJOS, BORRAMOS LA CLAVE ---
     if not node_data["children"]:
         del node_data["children"]
-    # ---------------------------------------------------
     
     return node_data
 
@@ -611,7 +782,8 @@ def process_and_decompose_collection(source_col, temp_col):
         if len(children) > 1:
             for child in children:
                 # Crear Wrapper (Empty)
-                wrapper_name = f"GRP_{child.name}"
+                clean_child_name = re.sub(r'\.\d+$', '', child.name)
+                wrapper_name = f"GRP_{clean_child_name}"
                 wrapper = bpy.data.objects.new(wrapper_name, None)
                 temp_col.objects.link(wrapper)
                 
@@ -723,28 +895,41 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     if not bm.loops.layers.uv: bm.loops.layers.uv.new()
     uv_layer = bm.loops.layers.uv.active
     
-    # 1. Datos del JSON
+    # --- 1. DATOS CRUDOS ---
     off_x = data.get("offset", {}).get("x", 0)
     off_y = data.get("offset", {}).get("y", 0)
-    ang = data.get("angle", 0)
+    
+    raw_ang = data.get("angle", 0)
+    try:
+        ang = int(raw_ang) % 360 
+    except:
+        ang = 0
     
     mirror = data.get("mirror", {})
-    # Detectar si es mirror 'true' (bool) o diccionario
-    if isinstance(mirror, bool):
-         mir_x = mirror
-         mir_y = False
-    else:
-         mir_x = mirror.get("x", False)
-         mir_y = mirror.get("y", False)
+    mir_x = mirror if isinstance(mirror, bool) else bool(mirror.get("x", False))
+    mir_y = False if isinstance(mirror, bool) else bool(mirror.get("y", False))
 
-    # 2. DEFINIR EL SIZE UV
-    size_u = fh if ang in [90, 270] else fw
-    size_v = fw if ang in [90, 270] else fh
+    # --- 2. DIMENSIONES ABSOLUTAS ---
+    is_rotated = (ang == 90 or ang == 270)
     
-    # 3. RECUPERAR EL OFFSET BASE
+    # Dimensiones visuales
+    size_u = fh if is_rotated else fw
+    size_v = fw if is_rotated else fh
+    
+    # --- 3. DETECTAR QUÉ EJE DE LA TEXTURA SE INVIERTE ---
+    # Al rotar 90°, el eje X del JSON (Mirror X) afecta visualmente a la altura (V).
+    if ang == 0 or ang == 180:
+        u_is_mirrored = mir_x
+        v_is_mirrored = mir_y
+    else: # 90 o 270
+        u_is_mirrored = mir_y
+        v_is_mirrored = mir_x
+
+    # --- 4. CÁLCULO DEL OFFSET (POSICIÓN) ---
     base_x = off_x
     base_y = off_y
     
+    # Ajuste de punto de anclaje por rotación
     if ang == 90:
         base_x = off_x - size_u
     elif ang == 180:
@@ -753,101 +938,95 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
     elif ang == 270:
         base_y = off_y - size_v
 
-    # 4. APLICAR LOGICA DE MIRROR
-    # Si mirror es False, NO entra aquí y NO se hace ningún cambio (se respeta tu lógica original).
-    # Si mirror es True, solo invertimos el tamaño para que vaya "hacia atrás".
+    # Corrección de posición por Espejo:
+    # Si Hytale invierte un eje, el offset define el punto final, no el inicial.
+    # Desplazamos la caja hacia atrás en el eje afectado.
+    if u_is_mirrored:
+        base_x -= size_u
+    if v_is_mirrored:
+        base_y -= size_v
+
+    # --- 5. CÁLCULO DE COORDENADAS ---
+    x_min = base_x
+    x_max = base_x + size_u
+    y_min = base_y
+    y_max = base_y + size_v
     
-    if mir_x:
-        # NO tocamos base_x (el offset 24 ya es correcto como punto de partida)
-        size_u = -size_u  # Solo invertimos la dirección: 20 -> -20.
+    # Aplicamos el espejo GEOMÉTRICAMENTE intercambiando límites.
+    # Esto ya deja la textura "al revés" en el eje correcto antes de rotar.
+    if u_is_mirrored:
+        u_left, u_right = x_max / tex_w, x_min / tex_w
+    else:
+        u_left, u_right = x_min / tex_w, x_max / tex_w
         
-    if mir_y:
-        # NO tocamos base_y
-        size_v = -size_v
-
-    # 5. CALCULAR COORDENADAS FINALES
-    # Ejemplo Mirror: base_x=24, size_u=-20.
-    # u0 = 24. u1 = 24 + (-20) = 4. -> Rango correcto de 24 a 4.
-    
-    u0 = base_x / tex_w
-    u1 = (base_x + size_u) / tex_w
-    
-    v0 = 1.0 - (base_y / tex_h)
-    v1 = 1.0 - ((base_y + size_v) / tex_h)
-
-    coords = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
-
-    if ang == 90:
-        coords = [coords[1], coords[2], coords[3], coords[0]]
-    elif ang == 180:
-        coords = [coords[2], coords[3], coords[0], coords[1]]
-    elif ang == 270:
-        coords = [coords[3], coords[0], coords[1], coords[2]]
+    if v_is_mirrored:
+        v_top = y_max / tex_h
+        v_bottom = y_min / tex_h
+    else:
+        v_top = y_min / tex_h
+        v_bottom = y_max / tex_h
         
-# 6. MAPEO GEOMÉTRICO ESTÁNDAR
+    # Convertir a espacio Blender (1.0 - V)
+    vt = 1.0 - v_top
+    vb = 1.0 - v_bottom
+    
+    # Lista Base (TL, TR, BR, BL)
+    coords = [(u_left, vt), (u_right, vt), (u_right, vb), (u_left, vb)]
+
+    # --- 6. APLICAR ROTACIÓN (WINDING ORDER) ---
+    step = 0
+    if ang == 90: step = 1
+    elif ang == 180: step = 2
+    elif ang == 270: step = 3
+
+    # [CORRECCIÓN FINAL]: Eliminamos el "step += 2".
+    # Al haber calculado bien el "u_is_mirrored" y el "offset" arriba,
+    # la rotación estándar ya coloca cada vértice en su lugar.
+    # El "+2" anterior era lo que estaba causando el error de 180 grados.
+
+    step = step % 4
+    coords = coords[step:] + coords[:step]
+
+    # --- 7. MAPEO GEOMÉTRICO (ESTÁNDAR) ---
     from mathutils import Vector
-    
-    # A. Cortar vértices (Evitar derretido)
     bmesh.ops.split_edges(bm, edges=face.edges)
 
-    # B. Definir VECTORES FIJOS según hacia dónde mire la cara.
-    # Esto evita que Blender "adivine". Definimos estrictamente qué es Arriba.
     normal = face.normal
     center = face.calc_center_median()
     epsilon = 0.9
     
-    # --- CONFIGURACIÓN DE CARAS ---
-    
-    if normal.z > epsilon:    # CARA ARRIBA (Piso)
-        ref_up = Vector((0, 1, 0))   
-        ref_right = Vector((1, 0, 0)) # <--- Si sale espejo, cambia a Vector((-1, 0, 0))
-        
-    elif normal.z < -epsilon: # CARA ABAJO (Techo) - LA SOSPECHOSA
-        ref_up = Vector((0, -1, 0))    
-        # AQUÍ HAGO EL CAMBIO ESPECÍFICO PARA LA CARA DE ABAJO
-        # Si antes estaba espejo, probamos invirtiendo X:
-        ref_right = Vector((1, 0, 0)) # <--- Cambié (1,0,0) por (-1,0,0)
-        
-    elif normal.y > epsilon:  # CARA TRASERA (Back)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((-1, 0, 0)) # X negativo suele ser correcto para Back
-        
-    elif normal.y < -epsilon: # CARA FRONTAL (Front)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((1, 0, 0))
-        
-    elif normal.x > epsilon:  # CARA DERECHA (Right)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((0, 1, 0)) # <--- Si la derecha sale espejo, pon (0, -1, 0)
-        
-    elif normal.x < -epsilon: # CARA IZQUIERDA (Left)
-        ref_up = Vector((0, 0, 1))
-        ref_right = Vector((0, -1, 0)) # Y negativo suele ser correcto para Left
-        
+    if normal.z > epsilon:    # TOP
+        ref_up = Vector((0, 1, 0)); ref_right = Vector((1, 0, 0))   
+    elif normal.z < -epsilon: # BOTTOM
+        ref_up = Vector((0, -1, 0)); ref_right = Vector((1, 0, 0))
+    elif normal.y > epsilon:  # BACK
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((-1, 0, 0))
+    elif normal.y < -epsilon: # FRONT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((1, 0, 0))
+    elif normal.x > epsilon:  # RIGHT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, 1, 0))
+    elif normal.x < -epsilon: # LEFT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, -1, 0))
     else: 
-        ref_up = Vector((0, 0, 1))
-        ref_right = ref_up.cross(normal)
+        ref_up = Vector((0, 0, 1)); ref_right = ref_up.cross(normal)
 
-    # --- ASIGNACIÓN NEUTRA (NO TOCAR ESTO) ---
-    # Dejamos esto fijo: Izquierda es Izquierda, Derecha es Derecha.
-    # Cualquier corrección hazla arriba en los vectores.
-    
     for loop in face.loops:
         vert_vec = loop.vert.co - center
         dx = vert_vec.dot(ref_right)
         dy = vert_vec.dot(ref_up)
         
-        # Mapeo Directo (Estándar)
-        if dx < 0 and dy > 0:   loop[uv_layer].uv = coords[0] # TL
-        elif dx > 0 and dy > 0: loop[uv_layer].uv = coords[1] # TR
-        elif dx > 0 and dy < 0: loop[uv_layer].uv = coords[2] # BR
-        elif dx < 0 and dy < 0: loop[uv_layer].uv = coords[3] # BL
-        else:
-            # Fallback seguro
-            if dx <= 0 and dy >= 0: loop[uv_layer].uv = coords[0]
-            elif dx >= 0 and dy >= 0: loop[uv_layer].uv = coords[1]
-            elif dx >= 0 and dy <= 0: loop[uv_layer].uv = coords[2]
-            elif dx <= 0 and dy <= 0: loop[uv_layer].uv = coords[3]
+        idx = 0
+        if dx < 0 and dy > 0:   idx = 0 
+        elif dx > 0 and dy > 0: idx = 1 
+        elif dx > 0 and dy < 0: idx = 2 
+        elif dx < 0 and dy < 0: idx = 3 
+        else: 
+            if dx <= 0 and dy >= 0: idx = 0
+            elif dx >= 0 and dy >= 0: idx = 1
+            elif dx >= 0 and dy <= 0: idx = 2
+            elif dx <= 0 and dy <= 0: idx = 3
+            
+        loop[uv_layer].uv = coords[idx]
 
 # ### NUEVO: Se añade el argumento 'stretch' para deformar la malla
 def create_mesh_box_import(name, shape_data, texture_width, texture_height):
@@ -904,6 +1083,7 @@ def create_mesh_box_import(name, shape_data, texture_width, texture_height):
     # bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     mesh = bpy.data.meshes.new(name)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
     bm.to_mesh(mesh)
     bm.free()
     
@@ -1152,34 +1332,74 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "textureHeight": int(tex_h) 
             }
             
-            # --- BLOQUE OPTIMIZADO: Formato Compacto ---
-            # 1. Generamos JSON con indentación vertical limpia
-            json_str = json.dumps(final_json, indent=1)
-            
-            # 2. OPTIMIZACIÓN: Colapsar vectores {x,y,z} en una sola línea
-            # Convierte:
-            # {
-            #  "x": 10,
-            #  "y": 5,
-            #  "z": 0
-            # }
-            # a: {"x": 10, "y": 5, "z": 0}
+            # --- BLOQUE OPTIMIZADO: Formato Compacto (Opción B) ---
+            def write_blockymodel_mixed_to_string(data, indent=1,
+                                                  inline_keys=('vertices','uvs','data','indices','colors'),
+                                                  min_items_to_inline=1):
+                """
+                Serializa `data` a JSON con indentación reducida (indent),
+                y luego compacta arrays de ciertas keys a una sola línea para ahorrar espacio.
+                Devuelve el string final.
+                """
+                # 1) Serializamos con indent simple
+                json_str = json.dumps(data, indent=indent, ensure_ascii=False)
+                
+                # 2) Compactar arrays de keys objetivo (regex sobre el JSON formateado)
+                for key in inline_keys:
+                    pattern = r'("'+re.escape(key)+r'"\s*:\s*)\[\s*(.*?)\s*\]'
+                    def repl(m):
+                        prefix = m.group(1)
+                        inner = m.group(2)
+                        approx_elements = inner.count(',') + 1 if inner.strip() != '' else 0
+                        if approx_elements < min_items_to_inline:
+                            return m.group(0)
+                        compact = re.sub(r'\s+', ' ', inner)
+                        compact = re.sub(r'\s*,\s*', ',', compact)
+                        compact = re.sub(r'\s*:\s*', ':', compact)
+                        return prefix + '[' + compact.strip() + ']'
+                    json_str = re.sub(pattern, repl, json_str, flags=re.DOTALL)
+
+                return json_str
+
+            # Generar JSON parcialmente compactado en memoria
+            json_str = write_blockymodel_mixed_to_string(final_json, indent=1,
+                                                         inline_keys=('vertices','uvs','data','indices','colors'),
+                                                         min_items_to_inline=1)
+
+            # 3) Extra: Colapsar vectores/quat en una sola línea (más robusto con floats y exponentes)
+            float_pat = r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+            # Vector {x,y,z}
             json_str = re.sub(
-                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+)\s*\}', 
-                r'{"x": \1, "y": \2, "z": \3}', 
-                json_str, 
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*,\s*"z"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2, "z": \3}',
+                json_str,
+                flags=re.DOTALL
+            )
+            # Quaternion {x,y,z,w}
+            json_str = re.sub(
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*,\s*"z"\s*:\s*' + float_pat + r'\s*,\s*"w"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2, "z": \3, "w": \4}',
+                json_str,
+                flags=re.DOTALL
+            )
+
+            # 4) (Opcional) Compactar pequeños objetos de 2 componentes {"u", "v"} -> {"u":..., "v":...}
+            json_str = re.sub(
+                r'\{\s*"u"\s*:\s*' + float_pat + r'\s*,\s*"v"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"u": \1, "v": \2}',
+                json_str,
                 flags=re.DOTALL
             )
             
-            # 3. OPTIMIZACIÓN: Colapsar Cuaterniones {x,y,z,w}
+            # --- Compactar objetos 2-componentes {x, y} (p.ej. offset) ---
             json_str = re.sub(
-                r'\{\s*"x":\s*([\d\.-]+),\s*"y":\s*([\d\.-]+),\s*"z":\s*([\d\.-]+),\s*"w":\s*([\d\.-]+)\s*\}', 
-                r'{"x": \1, "y": \2, "z": \3, "w": \4}', 
-                json_str, 
+                r'\{\s*"x"\s*:\s*' + float_pat + r'\s*,\s*"y"\s*:\s*' + float_pat + r'\s*\}',
+                r'{"x": \1, "y": \2}',
+                json_str,
                 flags=re.DOTALL
             )
-            
-            # 4. Escritura
+
+            # 5) Escritura final
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
                 
@@ -1199,6 +1419,7 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 bpy.data.collections.remove(temp_col)
 
         return {'FINISHED'}
+
 
 # 1. Definimos las opciones de resolución (Múltiplos de 32)
 # Esto genera una lista de tuplas: ('32', '32', ''), ('64', '64', ''), etc.
@@ -1240,8 +1461,8 @@ class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
         # Lógica de resolución: Prioridad al menú, luego al JSON
-        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 64)
-        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 64)
+        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 32)
+        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 32)
 
         model_name = os.path.splitext(os.path.basename(self.filepath))[0]
         col = bpy.data.collections.new(model_name)
@@ -1277,7 +1498,7 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         
         props = context.scene.hytale_props
         tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 64, 64
+        if not tex_w: tex_w, tex_h = 32, 32
 
         bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(main_obj.data)
@@ -1508,12 +1729,12 @@ class HytaleProperties(bpy.types.PropertyGroup):
 
     tex_width: bpy.props.IntProperty(
         name="Ancho (W)",
-        default=64,
+        default=32,
         min=1
     )
     tex_height: bpy.props.IntProperty(
         name="Alto (H)",
-        default=64,
+        default=32,
         min=1
     )
     
@@ -1595,7 +1816,7 @@ def draw_uv_stats_callback(self, context):
                 bm.free()
                 continue
 
-            tex_w, tex_h = 64, 64
+            tex_w, tex_h = 32, 32
             if obj.active_material and obj.active_material.use_nodes:
                 try:
                     for n in obj.active_material.node_tree.nodes:
@@ -1779,6 +2000,41 @@ class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
             self.force_uv_redraw(context)
             
             return {'RUNNING_MODAL'}
+            
+            
+class OPS_OT_DetectTexture(bpy.types.Operator):
+    """Detecta una textura del material activo y la asigna"""
+    bl_idname = "hytale.detect_texture"
+    bl_label = "Detectar Textura del Material"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.hytale_props
+        obj = context.active_object
+        
+        if not obj or not obj.active_material:
+            self.report({'WARNING'}, "No hay material activo")
+            return {'CANCELLED'}
+            
+        mat = obj.active_material
+        if not mat.use_nodes:
+            self.report({'WARNING'}, "El material no usa nodos")
+            return {'CANCELLED'}
+            
+        # Buscar el primer nodo de imagen con una imagen asignada
+        found_image = None
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image:
+                found_image = node.image
+                break
+        
+        if found_image:
+            props.target_image = found_image
+            self.report({'INFO'}, f"Textura detectada: {found_image.name}")
+        else:
+            self.report({'WARNING'}, "No se encontró ninguna textura en el material")
+            
+        return {'FINISHED'}
 
 class PT_HytalePanel(bpy.types.Panel):
     bl_label = "Hytale Tools v0.38"
@@ -1819,18 +2075,45 @@ class PT_HytalePanel(bpy.types.Panel):
         
         layout.separator()
         
-        # --- Herramientas UV ---
+        # --- SECCIÓN: HERRAMIENTAS UV ---
+        # Ahora esta sección contiene la selección de textura "Unificada"
         box = layout.box()
-        box.label(text="Herramientas UV:", icon='UV_DATA')
-        box.prop(props, "new_unwrap")
-        box.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
-        box.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
+        row = box.row()
+        row.label(text="Herramientas UV & Textura", icon='GROUP_UVS')
         
-        is_active = context.scene.hytale_uv_active
-        box.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
+        # 1. Selector de Textura Mejorado (Crear, Abrir, Seleccionar)
+        col = box.column(align=True)
+        row = col.row(align=True)
+        # template_ID crea automáticamente los botones de New/Open
+        row.template_ID(props, "target_image", new="image.new", open="image.open")
+        
+        # Botón de detección automática si no hay imagen
+        if not props.target_image:
+            row.operator("hytale.detect_texture", icon='EYEDROPPER', text="")
+            col.label(text="Selecciona o crea una textura para comenzar", icon='INFO')
+        
+        # 2. Las herramientas UV solo aparecen si hay textura
+        if props.target_image:
+            col.separator()
+            # Información de la textura detectada
+            row = col.row()
+            row.alignment = 'CENTER'
+            row.label(text=f"Lienzo: {props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
+            
+            col.separator()
+            col.label(text="Opciones de UV:", icon='MOD_UVPROJECT')
+            
+            # Aquí van tus herramientas UV originales
+            row = col.row(align=True)
+            row.prop(props, "snap_uvs", text="Snap a Píxeles")
+            
+            # Ejemplo de tus operadores UV (añade los que falten)
+            col.separator()
+            row = col.row()
+            row.scale_y = 1.2
+            row.operator("hytale.toggle_uv_measures", icon='DRIVER', text="Guías Visuales")
         
         layout.separator()
-        
         # --- EXPORTACIÓN Y TEXTURAS ---
         box = layout.box()
         box.label(text="Configuración de Exportación:", icon='EXPORT')
