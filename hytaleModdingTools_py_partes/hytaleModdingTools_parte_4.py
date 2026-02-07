@@ -117,24 +117,20 @@
         bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
         self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
 
-
-def update_target_material(self, context):
-    """
-    Callback: Cuando seleccionas un material, se aplica automáticamente
-    a TODOS los objetos de la colección seleccionada.
-    """
+def update_material_texture(self, context):
+    """Busca la textura conectada al Base Color del material seleccionado"""
     mat = self.target_material
-    collection = self.target_collection
+    if not mat or not mat.use_nodes:
+        return
     
-    if not collection or not mat: return
-        
-    for obj in collection.objects:
-        if obj.type == 'MESH':
-            # Asignar el material en la ranura 0 (o crearla)
-            if not obj.data.materials:
-                obj.data.materials.append(mat)
-            else:
-                obj.data.materials[0] = mat
+    # Buscar el nodo Principled BSDF
+    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf and bsdf.inputs['Base Color'].is_linked:
+        # Obtener el nodo conectado al color base
+        link = bsdf.inputs['Base Color'].links[0]
+        node = link.from_node
+        if node.type == 'TEX_IMAGE' and node.image:
+            self.target_image = node.image 
 
 def update_target_texture(self, context):
     """
@@ -187,15 +183,15 @@ class HytaleProperties(bpy.types.PropertyGroup):
     target_collection: bpy.props.PointerProperty(
         name="Colección",
         type=bpy.types.Collection,
-        description="Selecciona la colección del modelo"
+        description="Selecciona la colección del modelo para habilitar las demás herramientas"
     )
     
-    # --- NUEVO: Propiedad para el Material ---
+    # Al seleccionar el material, dispara la función 'update_material_texture'
     target_material: bpy.props.PointerProperty(
-        name="Material Base",
+        name="Material Unificado",
         type=bpy.types.Material,
-        description="Este material se aplicará a todo el modelo",
-        update=update_target_material
+        description="Material principal del modelo",
+        update=update_material_texture 
     )
     
     # --- SISTEMA DE SELECCIÓN DE TEXTURA ---
@@ -491,7 +487,6 @@ class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
             
             return {'RUNNING_MODAL'}
             
-            
 class OPS_OT_DetectTexture(bpy.types.Operator):
     """Detecta una textura del material activo y la asigna"""
     bl_idname = "hytale.detect_texture"
@@ -501,3 +496,12 @@ class OPS_OT_DetectTexture(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.hytale_props
         obj = context.active_object
+        
+        if not obj or not obj.active_material:
+            self.report({'WARNING'}, "No hay material activo")
+            return {'CANCELLED'}
+            
+        mat = obj.active_material
+        if not mat.use_nodes:
+            self.report({'WARNING'}, "El material no usa nodos")
+            return {'CANCELLED'}
