@@ -1627,24 +1627,20 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
         self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
 
-
-def update_target_material(self, context):
-    """
-    Callback: Cuando seleccionas un material, se aplica automáticamente
-    a TODOS los objetos de la colección seleccionada.
-    """
+def update_material_texture(self, context):
+    """Busca la textura conectada al Base Color del material seleccionado"""
     mat = self.target_material
-    collection = self.target_collection
+    if not mat or not mat.use_nodes:
+        return
     
-    if not collection or not mat: return
-        
-    for obj in collection.objects:
-        if obj.type == 'MESH':
-            # Asignar el material en la ranura 0 (o crearla)
-            if not obj.data.materials:
-                obj.data.materials.append(mat)
-            else:
-                obj.data.materials[0] = mat
+    # Buscar el nodo Principled BSDF
+    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf and bsdf.inputs['Base Color'].is_linked:
+        # Obtener el nodo conectado al color base
+        link = bsdf.inputs['Base Color'].links[0]
+        node = link.from_node
+        if node.type == 'TEX_IMAGE' and node.image:
+            self.target_image = node.image 
 
 def update_target_texture(self, context):
     """
@@ -1697,15 +1693,15 @@ class HytaleProperties(bpy.types.PropertyGroup):
     target_collection: bpy.props.PointerProperty(
         name="Colección",
         type=bpy.types.Collection,
-        description="Selecciona la colección del modelo"
+        description="Selecciona la colección del modelo para habilitar las demás herramientas"
     )
     
-    # --- NUEVO: Propiedad para el Material ---
+    # Al seleccionar el material, dispara la función 'update_material_texture'
     target_material: bpy.props.PointerProperty(
-        name="Material Base",
+        name="Material Unificado",
         type=bpy.types.Material,
-        description="Este material se aplicará a todo el modelo",
-        update=update_target_material
+        description="Material principal del modelo",
+        update=update_material_texture 
     )
     
     # --- SISTEMA DE SELECCIÓN DE TEXTURA ---
@@ -2001,7 +1997,6 @@ class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
             
             return {'RUNNING_MODAL'}
             
-            
 class OPS_OT_DetectTexture(bpy.types.Operator):
     """Detecta una textura del material activo y la asigna"""
     bl_idname = "hytale.detect_texture"
@@ -2037,7 +2032,7 @@ class OPS_OT_DetectTexture(bpy.types.Operator):
         return {'FINISHED'}
 
 class PT_HytalePanel(bpy.types.Panel):
-    bl_label = "Hytale Tools v0.38"
+    bl_label = "Hytale Tools v0.39"
     bl_idname = "VIEW3D_PT_hytale_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2047,12 +2042,17 @@ class PT_HytalePanel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.hytale_props
         
+                
+        # 0. DIAGNÓSTICO (Restaurado)
+        draw_validator_ui(self, context, layout)
+        
+        #1. IMPORTACIÓN (Siempre visible)
         box = layout.box()
         box.label(text="Importar (Blockymodel):", icon='IMPORT')
+        row = box.row()
         box.operator("hytale.import_model", icon='FILE_FOLDER', text="Cargar Modelo")
         
         layout.separator()
-        
         
         box = layout.box()
         box.label(text="Utilidades & Referencias:", icon='TOOL_SETTINGS')
@@ -2062,109 +2062,78 @@ class PT_HytalePanel(bpy.types.Panel):
         
         layout.separator()
         
-        # --- Configuración y Referencias ---
-        box = layout.box()
-        box.label(text="Configuración:", icon='PREFERENCES')
-        box.prop(props, "setup_pixel_grid", text="Modo Pixel Perfect")
+        # 2. CONFIGURACIÓN GENERAL (Setup)
+        box_main = layout.box()
+        box_main.label(text="Configuración de Escena", icon='PREFERENCES')
+        box_main.separator()
+        
+        # SELECCIÓN DE COLECCIÓN (El interruptor principal)
+        box_main.prop(props, "target_collection", icon='OUTLINER_COLLECTION')
+        
+        has_collection = props.target_collection is not None
+        if not has_collection:
+            box_main.label(text="¡Selecciona colección para editar!", icon='INFO')
+        row = box_main.row(align=True)
+        box_main.prop(props, "setup_pixel_grid", text="Modo Pixel Perfect")
         if props.setup_pixel_grid:
-            col = box.column()
-            col.prop(props, "show_subdivisions", icon='GRID')
+            col_main = box_main.column()
+            col_main.prop(props, "show_subdivisions", icon='GRID')
+
+        box_main.separator()
         
         layout.separator()
-        draw_validator_ui(self, context, layout) # Tu función de diagnóstico
+
+        # 3. MATERIAL Y TEXTURA (El nuevo núcleo)
+        box_mat = layout.box()
+        box_mat.label(text="Material y Textura", icon='MATERIAL')
+        box_mat.enabled = has_collection # Bloqueo visual si no hay colección
         
-        layout.separator()
+        col = box_mat.column(align=True)
+        col.template_ID(props, "target_material", new="material.new")
         
-        # --- SECCIÓN: HERRAMIENTAS UV ---
-        # Ahora esta sección contiene la selección de textura "Unificada"
-        box = layout.box()
-        row = box.row()
-        row.label(text="Herramientas UV & Textura", icon='GROUP_UVS')
-        
-        # 1. Selector de Textura Mejorado (Crear, Abrir, Seleccionar)
-        col = box.column(align=True)
-        row = col.row(align=True)
-        # template_ID crea automáticamente los botones de New/Open
-        row.template_ID(props, "target_image", new="image.new", open="image.open")
-        
-        # Botón de detección automática si no hay imagen
-        if not props.target_image:
+        if props.target_material:
+            col.separator()
+            row = col.row(align=True)
+            # template_ID para Textura (Nueva/Abrir/Seleccionar)
+            row.template_ID(props, "target_image", new="image.new", open="image.open")
+            
+            # Botón de re-detección manual
             row.operator("hytale.detect_texture", icon='EYEDROPPER', text="")
-            col.label(text="Selecciona o crea una textura para comenzar", icon='INFO')
+            
+            if props.target_image:
+                row = col.row()
+                row.alignment = 'CENTER'
+                row.label(text=f"{props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
+        else:
+            col.label(text="Selecciona Material Unificado", icon='ERROR')
+
+        layout.separator()
+
+        # --- Herramientas UV ---
+        box = layout.box()
+        box.label(text="Herramientas UV:", icon='UV_DATA')
+        box.prop(props, "new_unwrap")
+        box.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
+        box.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
         
-        # 2. Las herramientas UV solo aparecen si hay textura
-        if props.target_image:
-            col.separator()
-            # Información de la textura detectada
-            row = col.row()
-            row.alignment = 'CENTER'
-            row.label(text=f"Lienzo: {props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
-            
-            col.separator()
-            col.label(text="Opciones de UV:", icon='MOD_UVPROJECT')
-            
-            # Aquí van tus herramientas UV originales
-            row = col.row(align=True)
-            row.prop(props, "snap_uvs", text="Snap a Píxeles")
-            
-            # Ejemplo de tus operadores UV (añade los que falten)
-            col.separator()
-            row = col.row()
-            row.scale_y = 1.2
-            row.operator("hytale.toggle_uv_measures", icon='DRIVER', text="Guías Visuales")
+        is_active = context.scene.hytale_uv_active
+        box.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
         
         layout.separator()
-        # --- EXPORTACIÓN Y TEXTURAS ---
-        box = layout.box()
-        box.label(text="Configuración de Exportación:", icon='EXPORT')
-        col = box.column(align=True)
-        
-        # 1. Elegir Colección
-        col.prop(props, "target_collection", icon='OUTLINER_COLLECTION')
-        
-        # 2. Elegir Material (Solo si hay colección)
-        if props.target_collection:
-            col.separator()
-            col.label(text="Material Unificado:", icon='MATERIAL')
-            col.prop(props, "target_material", text="")
-            
-        # 3. Elegir Textura (Solo si hay Material)
-        if props.target_collection and props.target_material:
-            col.separator()
-            col.label(text="Configuración de Textura:", icon='TEXTURE')
-            
-            row = col.row(align=True)
-            row.prop(props, "resolution_mode", expand=True)
-            
-            if props.resolution_mode == 'IMAGE':
-                # Interfaz Modo Imagen
-                box_inner = col.box()
-                box_inner.label(text="Selecciona la Skin:", icon='IMAGE_DATA')
-                box_inner.template_ID(props, "target_image", open="image.open")
-                
-                if props.target_image:
-                    row = box_inner.row()
-                    row.alignment = 'CENTER'
-                    row.label(text=f"Detectado: {props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
-                else:
-                    box_inner.label(text="¡Selecciona una imagen!", icon='INFO')
-            else:
-                # Interfaz Modo Manual
-                box_inner = col.box()
-                box_inner.label(text="Lienzo Manual:", icon='EDITMODE_HLT')
-                row = box_inner.row(align=True)
-                row.prop(props, "tex_width")
-                row.prop(props, "tex_height")
 
-            col.separator()
-            col.prop(props, "snap_uvs")
-            col.prop(props, "file_path", text="")
-            
-            row = col.row()
-            row.scale_y = 1.5
-            row.operator("hytale.export_model", icon='CHECKMARK', text="EXPORTAR")
+        # 6. EXPORTACIÓN
+        box_exp = layout.box()
+        box_exp.label(text="Exportación", icon='EXPORT')
+        box_exp.enabled = has_collection and (props.target_material is not None)
+        
+        col_exp = box_exp.column()
+        col_exp.prop(props, "file_path", text="") # Restaurado path manual
+        
+        row = col_exp.row()
+        row.scale_y = 1.5
+        row.operator("hytale.export_model", icon='CHECKMARK', text="EXPORTAR MODELO")
 
-classes = (HytaleProperties, OPS_OT_SetupHytaleScene, OPS_OT_LoadReference, OPS_OT_ExportHytale, OPS_OT_ImportHytale, PT_HytalePanel, OPS_OT_PixelPerfectPack, OPS_OT_ToggleUVMeasures)
+classes = (HytaleProperties, OPS_OT_SetupHytaleScene, OPS_OT_LoadReference, OPS_OT_ExportHytale, OPS_OT_ImportHytale, PT_HytalePanel, OPS_OT_DetectTexture, OPS_OT_PixelPerfectPack, OPS_OT_ToggleUVMeasures)
 
 def register():
     bpy.types.Scene.hytale_uv_active = bpy.props.BoolProperty(default=False)
