@@ -1536,8 +1536,8 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
 
         dominant_face = max(bm.faces, key=lambda f: f.calc_area())
         v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = mathutils.Vector(((v1.x-v0.x)*main_obj.scale.x, (v1.y-v0.y)*main_obj.scale.y, (v1.z-v0.z)*main_obj.scale.z)).length
-        h_3d = mathutils.Vector(((v3.x-v0.x)*main_obj.scale.x, (v3.y-v0.y)*main_obj.scale.y, (v3.z-v0.z)*main_obj.scale.z)).length
+        w_3d = (v1 - v0).length
+        h_3d = (v3 - v0).length
 
         uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
         curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
@@ -1627,20 +1627,101 @@ class OPS_OT_PixelPerfectPack(bpy.types.Operator):
         bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
         self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
 
+# --- VARIABLES DE CONTROL ---
+# --- VARIABLES DE CONTROL ---
+_last_processed_mat = None
+_is_updating = False
+
 def update_material_texture(self, context):
-    """Busca la textura conectada al Base Color del material seleccionado"""
-    mat = self.target_material
-    if not mat or not mat.use_nodes:
-        return
+    """
+    Gestor de Texturas (Push/Pull):
+    - Al pulsar X: Corta los cables inmediatamente y limpia memoria.
+    - Al elegir imagen: Crea/Conecta el nodo.
+    - Al cambiar material: Carga la textura que tenga ese material.
+    """
+    global _last_processed_mat, _is_updating
     
-    # Buscar el nodo Principled BSDF
-    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    if bsdf and bsdf.inputs['Base Color'].is_linked:
-        # Obtener el nodo conectado al color base
-        link = bsdf.inputs['Base Color'].links[0]
-        node = link.from_node
-        if node.type == 'TEX_IMAGE' and node.image:
-            self.target_image = node.image 
+    if _is_updating: return
+
+    mat = self.target_material
+    obj = context.active_object
+
+    # Asignar material al objeto activo
+    if obj and obj.type == 'MESH' and mat:
+        if not obj.data.materials:
+            obj.data.materials.append(mat)
+        elif obj.active_material != mat:
+            obj.active_material = mat
+
+    if not mat or not mat.use_nodes:
+        _last_processed_mat = None
+        return
+
+    tree = mat.node_tree
+    # Buscamos el nodo BSDF (compatible con Blender 3.6 y 4.0+)
+    bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not bsdf: return
+
+    # --- FASE 1: DETECTAR CAMBIO DE MATERIAL (PULL) ---
+    if mat != _last_processed_mat:
+        _last_processed_mat = mat
+        _is_updating = True
+        try:
+            # Verificamos si hay un nodo de imagen conectado al Base Color
+            tex_image = None
+            if bsdf.inputs['Base Color'].is_linked:
+                link = bsdf.inputs['Base Color'].links[0]
+                if link.from_node.type == 'TEX_IMAGE':
+                    tex_image = link.from_node.image
+            
+            # Sincronizamos el menú con lo que acabamos de encontrar
+            if self.target_image != tex_image:
+                self.target_image = tex_image
+        finally:
+            _is_updating = False
+        return
+
+    # --- FASE 2: ACCIÓN DEL USUARIO EN EL MENÚ (PUSH) ---
+
+    # CASO A: PULSAR LA "X" (DESCONECTAR)
+    if self.target_image is None:
+        # 1. Cortar todas las conexiones al Base Color que vengan de nodos de imagen
+        for link in bsdf.inputs['Base Color'].links:
+            if link.from_node.type == 'TEX_IMAGE':
+                tree.links.remove(link)
+        
+        # 2. Cortar todas las conexiones al Alpha
+        if 'Alpha' in bsdf.inputs:
+            for link in bsdf.inputs['Alpha'].links:
+                if link.from_node.type == 'TEX_IMAGE':
+                    tree.links.remove(link)
+        
+        # 3. Forzar al sistema a olvidar este material para que el Monitor de la UI
+        # se resetee y no intente restaurar la imagen.
+        _last_processed_mat = None
+        
+        # 4. Refrescar interfaz
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return
+
+    # CASO B: ASIGNAR TEXTURA (CONECTAR)
+    # Buscamos un nodo de imagen existente o creamos uno
+    tex_node = next((n for n in tree.nodes if n.type == 'TEX_IMAGE'), None)
+    if not tex_node:
+        tex_node = tree.nodes.new('ShaderNodeTexImage')
+        tex_node.location = (-300, 300)
+
+    # Actualizamos la imagen del nodo
+    tex_node.image = self.target_image
+    
+    # Aseguramos los cables
+    if not bsdf.inputs['Base Color'].is_linked or bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+        tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+    
+    if 'Alpha' in bsdf.inputs:
+        if not bsdf.inputs['Alpha'].is_linked or bsdf.inputs['Alpha'].links[0].from_node != tex_node:
+            tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
 
 def update_target_texture(self, context):
     """
@@ -2030,88 +2111,141 @@ class OPS_OT_DetectTexture(bpy.types.Operator):
             self.report({'WARNING'}, "No se encontró ninguna textura en el material")
             
         return {'FINISHED'}
+        
+# --- MEMORIA ESTRICTA ---
+# Guardamos el estado del nodo por material.
+# Solo actualizamos el menú si el NODO cambia respecto a esta memoria.
+_node_state_cache = {}
+_last_viewed_mat = None
+
+def sync_menu_from_node(props, image):
+    try:
+        if props.target_image != image:
+            props.target_image = image
+    except: pass
+    return None
 
 class PT_HytalePanel(bpy.types.Panel):
-    bl_label = "Hytale Tools v0.39"
+    bl_label = "Hytale Tools v0.40"
     bl_idname = "VIEW3D_PT_hytale_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Hytale'
 
     def draw(self, context):
+        global _last_viewed_mat
         layout = self.layout
         props = context.scene.hytale_props
         
-                
-        # 0. DIAGNÓSTICO (Restaurado)
-        draw_validator_ui(self, context, layout)
+        # 1. ANALIZAR ESTADO DE CONEXIÓN REAL
+        current_node_image = None
+        is_node_connected = False
+        mat = props.target_material
+
+        if mat and mat.use_nodes:
+            tree = mat.node_tree
+            bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            # La clave es 'is_linked': si no hay cable, para el menú no hay textura
+            if bsdf and bsdf.inputs['Base Color'].is_linked:
+                link_node = bsdf.inputs['Base Color'].links[0].from_node
+                if link_node.type == 'TEX_IMAGE':
+                    is_node_connected = True
+                    current_node_image = link_node.image
+
+        # 2. MONITOR DE CABLES (Tiempo Real)
+        if mat:
+            mat_name = mat.name
+            cached_image = _node_state_cache.get(mat_name)
+            
+            if mat != _last_viewed_mat:
+                _node_state_cache[mat_name] = current_node_image
+                _last_viewed_mat = mat
+            
+            elif current_node_image != cached_image:
+                # Si el cable se cortó o cambió, sincronizamos el menú
+                bpy.app.timers.register(lambda: sync_menu_from_node(props, current_node_image), first_interval=0.01)
+                _node_state_cache[mat_name] = current_node_image
+
+        # DIAGNÓSTICO
+        try: draw_validator_ui(self, context, layout)
+        except: pass
         
-        #1. IMPORTACIÓN (Siempre visible)
+        # IMPORTAR
         box = layout.box()
         box.label(text="Importar (Blockymodel):", icon='IMPORT')
-        row = box.row()
         box.operator("hytale.import_model", icon='FILE_FOLDER', text="Cargar Modelo")
-        
         layout.separator()
         
+        # UTILIDADES
         box = layout.box()
         box.label(text="Utilidades & Referencias:", icon='TOOL_SETTINGS')
         row = box.row(align=True)
         row.prop(props, "selected_reference", text="")
         row.operator("hytale.load_reference", icon='IMPORT', text="Cargar")
-        
         layout.separator()
         
-        # 2. CONFIGURACIÓN GENERAL (Setup)
+        # ESCENA
         box_main = layout.box()
         box_main.label(text="Configuración de Escena", icon='PREFERENCES')
         box_main.separator()
-        
-        # SELECCIÓN DE COLECCIÓN (El interruptor principal)
         box_main.prop(props, "target_collection", icon='OUTLINER_COLLECTION')
         
         has_collection = props.target_collection is not None
         if not has_collection:
             box_main.label(text="¡Selecciona colección para editar!", icon='INFO')
+        
         row = box_main.row(align=True)
         box_main.prop(props, "setup_pixel_grid", text="Modo Pixel Perfect")
         if props.setup_pixel_grid:
             col_main = box_main.column()
             col_main.prop(props, "show_subdivisions", icon='GRID')
 
-        box_main.separator()
-        
         layout.separator()
 
-        # 3. MATERIAL Y TEXTURA (El nuevo núcleo)
+        # --- MATERIAL Y TEXTURA ---
         box_mat = layout.box()
         box_mat.label(text="Material y Textura", icon='MATERIAL')
-        box_mat.enabled = has_collection # Bloqueo visual si no hay colección
+        box_mat.enabled = has_collection
         
         col = box_mat.column(align=True)
         col.template_ID(props, "target_material", new="material.new")
         
         if props.target_material:
             col.separator()
+            
+            # Selector Principal
             row = col.row(align=True)
-            # template_ID para Textura (Nueva/Abrir/Seleccionar)
             row.template_ID(props, "target_image", new="image.new", open="image.open")
-            
-            # Botón de re-detección manual
             row.operator("hytale.detect_texture", icon='EYEDROPPER', text="")
-            
+
             if props.target_image:
                 row = col.row()
                 row.alignment = 'CENTER'
                 row.label(text=f"{props.target_image.size[0]} x {props.target_image.size[1]} px", icon='CHECKMARK')
+            else:
+                row = col.row()
+                row.alignment = 'CENTER'
+                row.label(text="Asigna una textura", icon='INFO')
         else:
             col.label(text="Selecciona Material Unificado", icon='ERROR')
 
         layout.separator()
 
-        # --- Herramientas UV ---
+        # UV Y EXPORTACIÓN
         box = layout.box()
-        box.label(text="Herramientas UV:", icon='UV_DATA')
+        row_uv = box.row()
+        row_uv.label(text="Herramientas UV:", icon='UV_DATA')
+        
+        # Activamos herramientas si hay textura en el NODO (independiente del menú)
+        is_uv_enabled = has_collection and is_node_connected and current_node_image
+        box.enabled = bool(is_uv_enabled)
+        
+        if not is_uv_enabled:
+             if not has_collection:
+                 box.label(text="(Requiere Colección)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
+             elif not is_node_connected:
+                 box.label(text="(Falta Textura)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
+
         box.prop(props, "new_unwrap")
         box.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
         box.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
@@ -2121,14 +2255,11 @@ class PT_HytalePanel(bpy.types.Panel):
         
         layout.separator()
 
-        # 6. EXPORTACIÓN
         box_exp = layout.box()
         box_exp.label(text="Exportación", icon='EXPORT')
-        box_exp.enabled = has_collection and (props.target_material is not None)
-        
+        box_exp.enabled = bool(is_uv_enabled)
         col_exp = box_exp.column()
-        col_exp.prop(props, "file_path", text="") # Restaurado path manual
-        
+        col_exp.prop(props, "file_path", text="")
         row = col_exp.row()
         row.scale_y = 1.5
         row.operator("hytale.export_model", icon='CHECKMARK', text="EXPORTAR MODELO")
