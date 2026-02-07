@@ -26,8 +26,8 @@
 
         dominant_face = max(bm.faces, key=lambda f: f.calc_area())
         v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = mathutils.Vector(((v1.x-v0.x)*main_obj.scale.x, (v1.y-v0.y)*main_obj.scale.y, (v1.z-v0.z)*main_obj.scale.z)).length
-        h_3d = mathutils.Vector(((v3.x-v0.x)*main_obj.scale.x, (v3.y-v0.y)*main_obj.scale.y, (v3.z-v0.z)*main_obj.scale.z)).length
+        w_3d = (v1 - v0).length
+        h_3d = (v3 - v0).length
 
         uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
         curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
@@ -117,20 +117,101 @@
         bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
         self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
 
+# --- VARIABLES DE CONTROL ---
+# --- VARIABLES DE CONTROL ---
+_last_processed_mat = None
+_is_updating = False
+
 def update_material_texture(self, context):
-    """Busca la textura conectada al Base Color del material seleccionado"""
-    mat = self.target_material
-    if not mat or not mat.use_nodes:
-        return
+    """
+    Gestor de Texturas (Push/Pull):
+    - Al pulsar X: Corta los cables inmediatamente y limpia memoria.
+    - Al elegir imagen: Crea/Conecta el nodo.
+    - Al cambiar material: Carga la textura que tenga ese material.
+    """
+    global _last_processed_mat, _is_updating
     
-    # Buscar el nodo Principled BSDF
-    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    if bsdf and bsdf.inputs['Base Color'].is_linked:
-        # Obtener el nodo conectado al color base
-        link = bsdf.inputs['Base Color'].links[0]
-        node = link.from_node
-        if node.type == 'TEX_IMAGE' and node.image:
-            self.target_image = node.image 
+    if _is_updating: return
+
+    mat = self.target_material
+    obj = context.active_object
+
+    # Asignar material al objeto activo
+    if obj and obj.type == 'MESH' and mat:
+        if not obj.data.materials:
+            obj.data.materials.append(mat)
+        elif obj.active_material != mat:
+            obj.active_material = mat
+
+    if not mat or not mat.use_nodes:
+        _last_processed_mat = None
+        return
+
+    tree = mat.node_tree
+    # Buscamos el nodo BSDF (compatible con Blender 3.6 y 4.0+)
+    bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not bsdf: return
+
+    # --- FASE 1: DETECTAR CAMBIO DE MATERIAL (PULL) ---
+    if mat != _last_processed_mat:
+        _last_processed_mat = mat
+        _is_updating = True
+        try:
+            # Verificamos si hay un nodo de imagen conectado al Base Color
+            tex_image = None
+            if bsdf.inputs['Base Color'].is_linked:
+                link = bsdf.inputs['Base Color'].links[0]
+                if link.from_node.type == 'TEX_IMAGE':
+                    tex_image = link.from_node.image
+            
+            # Sincronizamos el menú con lo que acabamos de encontrar
+            if self.target_image != tex_image:
+                self.target_image = tex_image
+        finally:
+            _is_updating = False
+        return
+
+    # --- FASE 2: ACCIÓN DEL USUARIO EN EL MENÚ (PUSH) ---
+
+    # CASO A: PULSAR LA "X" (DESCONECTAR)
+    if self.target_image is None:
+        # 1. Cortar todas las conexiones al Base Color que vengan de nodos de imagen
+        for link in bsdf.inputs['Base Color'].links:
+            if link.from_node.type == 'TEX_IMAGE':
+                tree.links.remove(link)
+        
+        # 2. Cortar todas las conexiones al Alpha
+        if 'Alpha' in bsdf.inputs:
+            for link in bsdf.inputs['Alpha'].links:
+                if link.from_node.type == 'TEX_IMAGE':
+                    tree.links.remove(link)
+        
+        # 3. Forzar al sistema a olvidar este material para que el Monitor de la UI
+        # se resetee y no intente restaurar la imagen.
+        _last_processed_mat = None
+        
+        # 4. Refrescar interfaz
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return
+
+    # CASO B: ASIGNAR TEXTURA (CONECTAR)
+    # Buscamos un nodo de imagen existente o creamos uno
+    tex_node = next((n for n in tree.nodes if n.type == 'TEX_IMAGE'), None)
+    if not tex_node:
+        tex_node = tree.nodes.new('ShaderNodeTexImage')
+        tex_node.location = (-300, 300)
+
+    # Actualizamos la imagen del nodo
+    tex_node.image = self.target_image
+    
+    # Aseguramos los cables
+    if not bsdf.inputs['Base Color'].is_linked or bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+        tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+    
+    if 'Alpha' in bsdf.inputs:
+        if not bsdf.inputs['Alpha'].is_linked or bsdf.inputs['Alpha'].links[0].from_node != tex_node:
+            tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
 
 def update_target_texture(self, context):
     """
@@ -420,88 +501,3 @@ class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
             if draw_handle_uv_stats:
                 bpy.types.SpaceImageEditor.draw_handler_remove(draw_handle_uv_stats, 'WINDOW')
                 draw_handle_uv_stats = None
-            
-            context.scene.hytale_uv_active = False
-            self.force_uv_redraw(context)
-            return {'FINISHED'}
-        
-        # --- COMPORTAMIENTO: SOLO CLIC ---
-        is_action = False
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE'} and event.value == 'PRESS':
-            is_action = True
-        elif event.type not in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'TIMER', 'TIMER_REPORT'} and event.value == 'PRESS':
-            is_action = True
-            
-        if is_action:
-            last_click_abs_x = event.mouse_x
-            last_click_abs_y = event.mouse_y
-            self.force_uv_redraw(context)
-            
-        return {'PASS_THROUGH'}
-
-    def invoke(self, context, event):
-        global uv_measures_running, draw_handle_uv_stats, last_click_abs_x, last_click_abs_y
-        
-        if uv_measures_running:
-            uv_measures_running = False
-            self.report({'INFO'}, "Medidas UV: DESACTIVADO")
-            return {'FINISHED'}
-        else:
-            uv_measures_running = True
-            context.scene.hytale_uv_active = True
-            
-            # ---------------------------------------------------------
-            # CONFIGURACIÓN AUTOMÁTICA (FULL COMBO)
-            # ---------------------------------------------------------
-            
-  
-            
-            # 1. Asegurar Modo Edición
-            if context.active_object and context.active_object.mode != 'EDIT':
-                bpy.ops.object.mode_set(mode='EDIT')
-            
-            # 2. ACTIVAR UV SYNC (¡Lo nuevo!)
-            context.scene.tool_settings.use_uv_select_sync = True
-            
-            # 3. Cambiar a MODO CARAS
-            # Como Sync está activo, controlamos la selección 3D
-            context.tool_settings.mesh_select_mode = (False, False, True) 
-            
-            # 4. Seleccionar TODO
-            try:
-                bpy.ops.mesh.select_all(action='SELECT')
-            except:
-                pass
-            
-            # ---------------------------------------------------------
-
-            last_click_abs_x = event.mouse_x
-            last_click_abs_y = event.mouse_y
-
-            draw_handle_uv_stats = bpy.types.SpaceImageEditor.draw_handler_add(
-                draw_uv_stats_callback, (self, context), 'WINDOW', 'POST_PIXEL')
-            
-            context.window_manager.modal_handler_add(self)
-            self.report({'INFO'}, "Medidas UV: LISTO (Sync + Caras + Todo)")
-            self.force_uv_redraw(context)
-            
-            return {'RUNNING_MODAL'}
-            
-class OPS_OT_DetectTexture(bpy.types.Operator):
-    """Detecta una textura del material activo y la asigna"""
-    bl_idname = "hytale.detect_texture"
-    bl_label = "Detectar Textura del Material"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        props = context.scene.hytale_props
-        obj = context.active_object
-        
-        if not obj or not obj.active_material:
-            self.report({'WARNING'}, "No hay material activo")
-            return {'CANCELLED'}
-            
-        mat = obj.active_material
-        if not mat.use_nodes:
-            self.report({'WARNING'}, "El material no usa nodos")
-            return {'CANCELLED'}
