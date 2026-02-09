@@ -37,7 +37,7 @@ RESERVED_NAMES = {}
 # --- UTILIDADES GENERALES ---
 
 def standard_round(n):
-    return int(math.floor(n + 0.5))
+    return int(math.floor(n + 0.50001))
 
 def get_image_size_from_objects(objects):
     for obj in objects:
@@ -163,24 +163,72 @@ def draw_validator_ui(self, context, layout):
     negative_scale_objs = []
     no_mat_objs = []
     mesh_parent_mesh_objs = []
+    no_texture_connected_objs = []  # <-- nuevo: objetos cuyo material no tiene textura conectada
     
     for obj in collection.objects:
         if obj.type == 'MESH':
             # Checks
-            if obj.scale.x < 0 or obj.scale.y < 0 or obj.scale.z < 0: negative_scale_objs.append(obj.name)
-            if not obj.data.materials: no_mat_objs.append(obj.name)
-            if len(obj.data.vertices) > 8: complex_objs.append(obj.name)
-            if obj.parent and obj.parent.type == 'MESH': mesh_parent_mesh_objs.append(obj.name)
+            if obj.scale.x < 0 or obj.scale.y < 0 or obj.scale.z < 0:
+                negative_scale_objs.append(obj.name)
+            if not obj.data.materials:
+                no_mat_objs.append(obj.name)
+            if len(obj.data.vertices) > 8:
+                complex_objs.append(obj.name)
+            if obj.parent and obj.parent.type == 'MESH':
+                mesh_parent_mesh_objs.append(obj.name)
 
-    # Siblings check
+            # Check: textura conectada al material (si tiene materiales)
+            has_texture = False
+            if obj.data.materials:
+                # Recorremos todos los materiales asignados y consideramos OK si cualquiera tiene textura conectada
+                for mat in obj.data.materials:
+                    if not mat:
+                        continue
+                    if mat.use_nodes and mat.node_tree:
+                        # Buscar BSDF principled(s)
+                        bsdfs = [n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED']
+                        # Si no hay Principled, intentar detectar ImageTexture link a cualquier socket llamado "Base Color"
+                        if bsdfs:
+                            for bsdf in bsdfs:
+                                for link in mat.node_tree.links:
+                                    if link.to_node == bsdf and link.to_socket.name == 'Base Color':
+                                        # desde qué nodo viene el link
+                                        from_node = link.from_node
+                                        if getattr(from_node, "image", None) is not None:
+                                            has_texture = True
+                                            break
+                                if has_texture:
+                                    break
+                        else:
+                            # Fallback: buscar Image Texture con imagen y que tenga links salientes
+                            for node in mat.node_tree.nodes:
+                                if node.type == 'TEX_IMAGE' and getattr(node, "image", None) is not None:
+                                    # comprobar si ese nodo está conectado a algo (me interesa que vaya al BSDF)
+                                    for link in mat.node_tree.links:
+                                        if link.from_node == node:
+                                            # si enlaza a algo, asumimos que se usa como textura
+                                            has_texture = True
+                                            break
+                                    if has_texture:
+                                        break
+                    if has_texture:
+                        break
+
+            # Si tiene material(s) pero ninguna textura conectada -> reportar
+            if obj.data.materials and not has_texture:
+                no_texture_connected_objs.append(obj.name)
+
+    # Siblings check (mantengo tu lógica: detecta múltiples hijos compartiendo el mismo parent cuando el parent NO es mesh)
     siblings_issue = False
     parent_map = {}
     for obj in collection.objects:
         if obj.parent and obj.type == 'MESH':
             if obj.parent.type != 'MESH':
-                if obj.parent.name not in parent_map: parent_map[obj.parent.name] = 0
+                if obj.parent.name not in parent_map:
+                    parent_map[obj.parent.name] = 0
                 parent_map[obj.parent.name] += 1
-                if parent_map[obj.parent.name] > 1: siblings_issue = True
+                if parent_map[obj.parent.name] > 1:
+                    siblings_issue = True
 
     # Render
     if complex_objs:
@@ -189,7 +237,8 @@ def draw_validator_ui(self, context, layout):
         col.alert = True 
         col.label(text="Geometría Compleja (ERROR):", icon='CANCEL')
         col.label(text="(Modelo con vertices > 8 detectado.)", icon='BLANK1')
-        for name in complex_objs[:5]: col.label(text=f"• {name}", icon='MESH_DATA')
+        for name in complex_objs[:5]:
+            col.label(text=f"• {name}", icon='MESH_DATA')
         col.separator()
 
     if mesh_parent_mesh_objs:
@@ -206,7 +255,8 @@ def draw_validator_ui(self, context, layout):
         col = box.column(align=True)
         col.alert = True
         col.label(text="Escala Negativa (Caras invertidas):", icon='ERROR')
-        for name in negative_scale_objs[:3]: col.label(text=f"• {name}")
+        for name in negative_scale_objs[:3]:
+            col.label(text=f"• {name}")
         col.separator()
 
     if no_mat_objs:
@@ -214,11 +264,23 @@ def draw_validator_ui(self, context, layout):
         col = box.column(align=True)
         col.alert = True
         col.label(text="Falta Material/Textura:", icon='MATERIAL')
-        for name in no_mat_objs[:3]: col.label(text=f"• {name}")
+        for name in no_mat_objs[:3]:
+            col.label(text=f"• {name}")
+        col.separator()
+
+    # Nuevo bloque: materiales presentes pero sin textura conectada al Base Color
+    if no_texture_connected_objs:
+        issues_found = True
+        col = box.column(align=True)
+        col.alert = True
+        col.label(text="Textura no conectada al material:", icon='ERROR')
+        col.label(text="ACCIÓN: Conecta una Image Texture al Base Color del Principled BSDF.", icon='NODE_TEXTURE')
+        for name in no_texture_connected_objs[:5]:
+            col.label(text=f"• {name}", icon='MESH_DATA')
         col.separator()
 
     if siblings_issue:
-        issues_found = False
+        issues_found = True  # CORREGIDO: antes estaba en False y anulaba otros issues
         col = box.column(align=True)
         col.label(text="Jerarquía Múltiple (Empties)", icon='INFO')
         col.label(text="Se crearán Wrappers individuales.", icon='CHECKMARK')
@@ -524,44 +586,50 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     
     # NUEVO: Detección de Stretch
     # Usamos la escala del objeto como stretch.
-    # Redondeamos a 4 decimales para evitar 1.0000001
     stretch_x = round(sca.x, 4)
     stretch_y = round(sca.z, 4) # Blender Z es Hytale Y
     stretch_z = round(sca.y, 4) # Blender Y es Hytale Z
     
-    has_stretch = (stretch_x != 1.0 or stretch_y != 1.0 or stretch_z != 1.0)
+    # [CORRECCIÓN SOLICITADA]: "poner stretch 1 en las mallas que se exporten con scale 1"
+    # Aseguramos que si el valor es 1.0, se quede como 1.0 en el objeto stretch.
+    # (El código anterior tal vez intentaba optimizarlo a 0 o borrarlo).
     
     if obj.type == 'MESH' and len(obj.data.vertices) > 0:
-        # [CAMBIO CRÍTICO]: Obtenemos dimensiones BASADAS EN VÉRTICES (Sin escala de objeto)
         verts = [v.co for v in obj.data.vertices]
         min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
         max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
-        
-        # Dimensiones puras de la malla (Raw mesh data)
-        # NO multiplicamos por obj.scale aquí.
         
         local_center = (min_v + max_v) / 2.0
         final_dims = mathutils.Vector((abs(max_v.x - min_v.x), abs(max_v.y - min_v.y), abs(max_v.z - min_v.z)))
         has_geometry = True
 
-    # --- Normalize name: strip Blender auto-suffixes like ".001", ".002" ---
+    # --- Normalize name ---
     base_name = re.sub(r'\.\d+$', '', obj.name)
     final_name = base_name
     if final_name in RESERVED_NAMES:
         final_name = final_name + "_Geo"
 
-    node_data = {
-        "id": str(id_counter[0]),
-        "name": final_name,
-        "position": blender_to_hytale_pos(loc),      
-        "orientation": blender_to_hytale_quat(rot),  
-        "children": [],
-        "shape": {"type": "none"} 
+    # Definir estructura Shape COMPLETA por defecto
+    hytale_shape = {
+        "type": "none",
+        "offset": {"x": 0, "y": 0, "z": 0},
+        # Aquí asignamos directamente los valores de stretch (sean 1 o lo que sean)
+        "stretch": {
+            "x": stretch_x,
+            "y": stretch_y,
+            "z": stretch_z
+        },
+        "settings": {
+            "isPiece": False
+        },
+        "textureLayout": {},
+        "unwrapMode": "custom",
+        "visible": True,
+        "doubleSided": False,
+        "shadingMode": "flat"
     }
-    id_counter[0] += 1
 
     def get_hytale_size(val, do_snap):
-        # Escala Global fija (16.0) para convertir metros a unidades bloque
         scaled = val * FIXED_GLOBAL_SCALE
         if do_snap:
             return int(round(scaled))
@@ -570,40 +638,22 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     if has_geometry:
         is_plane = (final_dims.x < 0.001) or (final_dims.y < 0.001) or (final_dims.z < 0.001)
         
-        # El offset de la forma (shape offset) debe tener en cuenta que 
-        # local_center está en espacio sin escalar.
-        # Si aplicamos stretch en Hytale, el offset interno también se estira.
-        # Por lo general, Hytale aplica el stretch desde el centro del pivote.
         shape_offset = blender_to_hytale_pos(local_center)
-        
-        # Extraemos UVs (La función nueva)
         texture_layout = extract_uvs(obj, out_w, out_h, snap_to_pixels=snap_uvs)
-
         hytale_normal = None
         
-        # Lógica Box vs Quad
         if is_plane:
-            # (Tu lógica de Quads existente, ajustada a get_hytale_size sin obj.scale)
+            # QUAD LOGIC
             if final_dims.x < 0.001: 
                 hytale_normal = "+X"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.y, snap_uvs), 
-                    "y": get_hytale_size(final_dims.z, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.y, snap_uvs), "y": get_hytale_size(final_dims.z, snap_uvs) }
             elif final_dims.z < 0.001: 
                 hytale_normal = "+Y"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.x, snap_uvs), 
-                    "y": get_hytale_size(final_dims.y, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.x, snap_uvs), "y": get_hytale_size(final_dims.y, snap_uvs) }
             else: 
                 hytale_normal = "+Z"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.x, snap_uvs), 
-                    "y": get_hytale_size(final_dims.z, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.x, snap_uvs), "y": get_hytale_size(final_dims.z, snap_uvs) }
             
-            # Validación de cara para Quads
             valid_face = None
             for k, v in texture_layout.items():
                 if v["offset"]["x"] != 0 or v["offset"]["y"] != 0 or v["angle"] != 0:
@@ -614,12 +664,13 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
             texture_layout = {"front": valid_face} if valid_face else {}
             
         else:
-            # Cuboides
+            # BOX LOGIC
             full_size = {
                 "x": get_hytale_size(final_dims.x, snap_uvs), 
                 "y": get_hytale_size(final_dims.z, snap_uvs), 
                 "z": get_hytale_size(final_dims.y, snap_uvs)
             }
+            # Filtrado de dimensiones 0
             filtered_size = {k: v for k, v in full_size.items() if v != 0}
             
             clean_layout = {}
@@ -627,30 +678,37 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
                 clean_layout[k] = v
             texture_layout = clean_layout
 
-        node_data["shape"] = {
-            "type": "quad" if is_plane else "box",
-            "offset": shape_offset,
-            "textureLayout": texture_layout,
-            "unwrapMode": "custom",
-            "settings": {
-                "isPiece": False,
-                "size": filtered_size,
-                "isStaticBox": True
-            },
-            "doubleSided": is_plane,
-            "shadingMode": "flat"
-        }
+        # Corrección estricta de Mirror
+        for face_name, face_data in texture_layout.items():
+            current_mirror = face_data.get("mirror", False)
+            if isinstance(current_mirror, bool):
+                face_data["mirror"] = {"x": current_mirror, "y": False}
+            elif isinstance(current_mirror, dict):
+                if "x" not in current_mirror: current_mirror["x"] = False
+                if "y" not in current_mirror: current_mirror["y"] = False
         
+        # Actualización de Shape
+        hytale_shape["type"] = "quad" if is_plane else "box"
+        hytale_shape["offset"] = shape_offset
+        hytale_shape["textureLayout"] = texture_layout
+        hytale_shape["settings"]["size"] = filtered_size
+        hytale_shape["doubleSided"] = is_plane
+        # Eliminamos isStaticBox si causaba problemas, o lo dejamos si es necesario para tu pipeline.
+        # En tu código de ejemplo lo habías comentado como FIX 3. Lo quito para seguridad.
+        # hytale_shape["settings"]["isStaticBox"] = True 
+
         if hytale_normal: 
-            node_data["shape"]["settings"]["normal"] = hytale_normal
-        
-        # [NUEVO] Inserción de propiedad 'stretch'
-        if has_stretch:
-            node_data["shape"]["stretch"] = {
-                "x": stretch_x,
-                "y": stretch_y,
-                "z": stretch_z
-            }
+            hytale_shape["settings"]["normal"] = hytale_normal
+
+    node_data = {
+        "id": str(id_counter[0]),
+        "name": final_name,
+        "position": blender_to_hytale_pos(loc),      
+        "orientation": blender_to_hytale_quat(rot),  
+        "children": [],
+        "shape": hytale_shape 
+    }
+    id_counter[0] += 1
 
     for child in obj.children:
         node_data["children"].append(process_node(child, out_w, out_h, snap_uvs, id_counter))
@@ -1127,85 +1185,72 @@ def create_mesh_quad_import(name, shape_data, texture_width, texture_height):
     for v in mesh.vertices: v.co += off_h
     return mesh
 
-def process_node_import(node_data, parent_obj, texture_width, texture_height, collection):
+# Añadimos un argumento nuevo al final: inherited_offset
+def process_node_import(node_data, parent_obj, texture_width, texture_height, collection, inherited_offset=None):
+    if inherited_offset is None:
+        inherited_offset = mathutils.Vector((0, 0, 0))
+
     name = node_data.get("name", "Node")
-    pos = hytale_to_blender_pos(node_data.get("position", {}))
+    
+    # 1. Posición base (La que dice el archivo)
+    raw_pos = node_data.get("position", {})
+    pos = hytale_to_blender_pos(raw_pos)
     rot = hytale_to_blender_quat(node_data.get("orientation", {}))
     
-    # --- 1. CREAR EL NODO PRINCIPAL (PIVOTE) ---
+    # --- APLICAR LA CORRECCIÓN SOLO AL NODO ACTUAL (HIJO) ---
+    # Sumamos el offset que nos mandó el padre (si hubo alguno)
+    # El padre no se mueve, pero el hijo nace desplazado para coincidir con la malla del padre.
+    final_pos = pos + inherited_offset
+
+    # --- 2. CREAR EL NODO (PIVOTE) ---
     node_empty = bpy.data.objects.new(name, None)
     node_empty.empty_display_type = 'PLAIN_AXES'
     node_empty.empty_display_size = 0.2
     collection.objects.link(node_empty)
     
-    node_empty.location = pos
+    # Usamos la posición corregida
+    node_empty.location = final_pos
     node_empty.rotation_mode = 'QUATERNION'
     node_empty.rotation_quaternion = rot
     
-    # Emparentar el Empty al padre (si existe)
     if parent_obj:
         node_empty.parent = parent_obj
     
-    # --- PRE-VERIFICACIÓN DE HIJOS ---
-    children_list = node_data.get("children", [])
-    has_children = len(children_list) > 0
-
-    # --- 2. CREAR LA FORMA (MESH) ---
+    # --- 3. PREPARAR EL OFFSET PARA MIS PROPIOS HIJOS ---
+    # Leemos si este nodo actual tiene un offset visual (shape.offset)
     shape_data = node_data.get("shape", {})
-    shape_type = shape_data.get("type", "none")
+    raw_shape_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
+    current_node_visual_offset = hytale_to_blender_pos(raw_shape_offset)
     
+    # --- 4. CREAR LA MESH ---
+    # (Tu lógica de creación de mesh se mantiene casi igual, 
+    #  pero asegurándonos de aplicar el offset visual A LA MALLA localmente)
+    
+    shape_type = shape_data.get("type", "none")
     if shape_type != "none":
         st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
-        mesh_obj = None # Inicializamos la variable
-
-        if has_children:
-            # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
-            shape_copy = shape_data.copy()
-            shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
-
-            if shape_type == 'box':
-                mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            else:
-                mesh = create_mesh_quad_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            
-            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
-            collection.objects.link(mesh_obj)
-
-            # Calcular Offset para el Wrapper
-            raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
-            target_pos = hytale_to_blender_pos(raw_offset)
-            
-            # Crear el Wrapper (Geo)
-            geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
-            geo_wrapper.empty_display_type = 'PLAIN_AXES'
-            geo_wrapper.empty_display_size = 0.1
-            collection.objects.link(geo_wrapper)
-            
-            # EMPARENTAMIENTO EN CADENA
-            geo_wrapper.parent = node_empty
-            geo_wrapper.location = target_pos
-            mesh_obj.parent = geo_wrapper
-            
+        
+        # Aquí SÍ usamos el offset normal en la malla, porque el pivote de ESTE nodo 
+        # no se ha movido por su propio offset, sino por el del padre.
+        # Por tanto, la malla necesita su propio offset local.
+        if shape_type == 'box':
+            mesh = create_mesh_box_import(name, shape_data, texture_width, texture_height)
         else:
-            # Caso Normal: Malla directa al Empty
-            if shape_type == 'box':
-                mesh = create_mesh_box_import(name + "_mesh", shape_data, texture_width, texture_height)
-            else:
-                mesh = create_mesh_quad_import(name + "_mesh", shape_data, texture_width, texture_height)
-                
-            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
-            collection.objects.link(mesh_obj)
+            mesh = create_mesh_quad_import(name, shape_data, texture_width, texture_height)
             
-            # EMPARENTAMIENTO DIRECTO
-            mesh_obj.parent = node_empty
-            
-        # Aplicar escala (esto ahora se hace después de asegurar que mesh_obj existe)
-        if mesh_obj:
-            mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
+        mesh_obj = bpy.data.objects.new(name, mesh)
+        collection.objects.link(mesh_obj)
+        mesh_obj.parent = node_empty
+        mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
 
-    # --- 3. PROCESAR HIJOS ---
+    # --- 5. PROCESAR HIJOS RECURSIVAMENTE ---
+    children_list = node_data.get("children", [])
     for child in children_list:
-        process_node_import(child, node_empty, texture_width, texture_height, collection)
+        # AQUÍ ESTÁ LA MAGIA:
+        # Pasamos el 'current_node_visual_offset' a los hijos.
+        # Si este nodo (Handle) tenía un offset de 5, el hijo (Hammer) recibirá ese 5
+        # y se sumará a su posición.
+        process_node_import(child, node_empty, texture_width, texture_height, collection, inherited_offset=current_node_visual_offset)
         
     return node_empty
     
@@ -1329,7 +1374,8 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "nodes": nodes_array, 
                 "format": "character", 
                 "textureWidth": int(tex_w), 
-                "textureHeight": int(tex_h) 
+                "textureHeight": int(tex_h), 
+                "lod": "auto"
             }
             
             # --- BLOQUE OPTIMIZADO: Formato Compacto (Opción B) ---
@@ -1474,295 +1520,315 @@ class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
 
         self.report({'INFO'}, f"Importado con resolución: {tex_w}x{tex_h}")
         return {'FINISHED'}
-
+        
+# -------------------------
+# Operator: Pixel Perfect + Constrain to Image Bounds
+# -------------------------
 class OPS_OT_PixelPerfectPack(bpy.types.Operator):
     bl_idname = "hytale.pixel_perfect_pack"
     bl_label = "Scale UV's To Pixel Perfect"
-    bl_description = "Alinea, escala y (opcionalmente) stackea UVs por intersección."
+    bl_description = "Escala UVs a pixel-perfect y restringe la selección completa al lienzo 0..1 (no por-isla)."
 
     def execute(self, context):
-        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        # Props & fallbacks
+        props = getattr(context.scene, "hytale_props", None)
+        if not props:
+            class _P:
+                new_unwrap = True
+                snap_uvs = True
+            props = _P()
+
+        def safe_get_image_size(objs):
+            try:
+                return get_image_size_from_objects(objs)
+            except Exception:
+                return 32, 32
+
+        def round_px(val_px):
+            return math.floor(val_px + 0.5)
+
+        def constrain_uvs_to_bounds(uvs):
+            """
+            Intenta meter las UVs en 0..1. 
+            IMPORTANTE: Si el bloque de UVs es más grande que 1.0 (tiling), 
+            se aborta la operación para no romper la densidad de píxeles.
+            """
+            if not uvs:
+                return
+
+            min_u = min(uv.x for uv in uvs)
+            max_u = max(uv.x for uv in uvs)
+            min_v = min(uv.y for uv in uvs)
+            max_v = max(uv.y for uv in uvs)
+            
+            width = max_u - min_u
+            height = max_v - min_v
+            eps = 1e-5 # Un margen pequeño pero seguro
+
+            # 1. CHECK DE TAMAÑO (La corrección principal)
+            # Si el bounding box total es mayor que el espacio 0..1,
+            # significa que necesitamos tiling. No restringimos.
+            if width > 1.0 + eps or height > 1.0 + eps:
+                return
+
+            # 2. Traslación (Shift) para meter bbox en 0..1 si cabe
+            # (No escalamos, solo movemos si se sale un poco pero cabe)
+            shift_u = 0.0
+            if min_u < 0.0:
+                shift_u = -min_u
+            elif max_u > 1.0:
+                shift_u = 1.0 - max_u
+            
+            shift_v = 0.0
+            if min_v < 0.0:
+                shift_v = -min_v
+            elif max_v > 1.0:
+                shift_v = 1.0 - max_v
+            
+            if shift_u != 0.0 or shift_v != 0.0:
+                for uv in uvs:
+                    uv.x += shift_u
+                    uv.y += shift_v
+
+        # -------------------------
+        # Inicio operator
+        # -------------------------
+        selected_meshes = [o for o in context.selected_objects if o.type == 'MESH']
         if not selected_meshes:
             self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
             return {'CANCELLED'}
 
-        if context.object and context.object.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        context.view_layer.objects.active = selected_meshes[0]
-        bpy.ops.object.join()
-        main_obj = context.active_object
-        
-        # 1. Reconstrucción de orientación para cálculos precisos (también usa el FIX)
-        reconstruct_orientation_from_geometry(main_obj)
-        
-        props = context.scene.hytale_props
-        tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 32, 32
+        tex_w, tex_h = safe_get_image_size(selected_meshes)
+        pixels_per_meter = 16.0
+        eps = 1e-8
 
         bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(main_obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
-        
-        # --- PASO 1: UNWRAP ---
-        bpy.ops.mesh.select_all(action='SELECT')
-        if props.new_unwrap:
-            try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001, correct_aspect=True)
-            except:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
 
-        # --- PASO 2: ALINEACIÓN (API Moderna) ---
-        area_uv = next((a for a in context.screen.areas if a.type == 'IMAGE_EDITOR'), None)
-        if area_uv:
-            with context.temp_override(area=area_uv):
-                try: 
-                    bpy.ops.uv.select_all(action='SELECT')
-                    bpy.ops.uv.align_rotation(method='AUTO', correct_aspect=True)
-                except: pass
-        
-        bmesh.update_edit_mesh(main_obj.data)
+        # Construir bmesh por objeto y lista global de faces
+        bm_map = {}
+        all_faces = []
+        for obj in selected_meshes:
+            bm = bmesh.from_edit_mesh(obj.data)
+            if not bm.loops.layers.uv:
+                bm.loops.layers.uv.new()
+            bm.loops.layers.uv.verify()
+            bm_map[obj] = bm
+            for f in bm.faces:
+                all_faces.append((f, bm))
 
-        # --- PASO 3: ESCALADO PIXEL PERFECT ---
-        all_loops = [l for f in bm.faces for l in f.loops]
-        if not all_loops:
+        if not all_faces:
             bpy.ops.object.mode_set(mode='OBJECT')
             return {'FINISHED'}
 
-        min_u_global = min(l[uv_layer].uv.x for l in all_loops)
-        max_u_global = max(l[uv_layer].uv.x for l in all_loops)
-        min_v_global = min(l[uv_layer].uv.y for l in all_loops)
-        max_v_global = max(l[uv_layer].uv.y for l in all_loops)
+        # Pre-unwrap / align si corresponde
+        bpy.ops.mesh.select_all(action='SELECT')
+        if props.new_unwrap:
+            try:
+                bpy.ops.uv.unwrap(method='CONFORMAL', margin=0.001)
+            except Exception:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
 
-        dominant_face = max(bm.faces, key=lambda f: f.calc_area())
-        v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = (v1 - v0).length
-        h_3d = (v3 - v0).length
+        # Cara dominante (usar para cálculo de escala uniforme)
+        dom_face, dom_bm = max(all_faces, key=lambda it: it[0].calc_area())
+        uv_layer_active = dom_bm.loops.layers.uv.active
 
-        uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
-        curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
-        curr_h_uv = max(0.0001, max(u.y for u in uvs_dom) - min(u.y for u in uvs_dom))
+        vec_3d_1 = dom_face.loops[1].vert.co - dom_face.loops[0].vert.co
+        vec_3d_2 = dom_face.loops[-1].vert.co - dom_face.loops[0].vert.co
+        len_3d_1 = vec_3d_1.length
+        len_3d_2 = vec_3d_2.length
 
-        scale_u = (w_3d * 16.0 / tex_w) / curr_w_uv
-        scale_v = (h_3d * 16.0 / tex_h) / curr_h_uv
+        uv0 = dom_face.loops[0][uv_layer_active].uv.copy()
+        uv1 = dom_face.loops[1][uv_layer_active].uv.copy()
+        uv3 = dom_face.loops[-1][uv_layer_active].uv.copy()
+        vec_uv_1 = uv1 - uv0
+        vec_uv_2 = uv3 - uv0
 
-        pivot = mathutils.Vector(((min_u_global + max_u_global) / 2.0, (min_v_global + max_v_global) / 2.0))
-        for f in bm.faces:
-            for l in f.loops:
-                l[uv_layer].uv.x = pivot.x + (l[uv_layer].uv.x - pivot.x) * scale_u
-                l[uv_layer].uv.y = pivot.y + (l[uv_layer].uv.y - pivot.y) * scale_v
-                if props.snap_uvs:
-                    l[uv_layer].uv.x = round(l[uv_layer].uv.x * tex_w) / tex_w
-                    l[uv_layer].uv.y = round(l[uv_layer].uv.y * tex_h) / tex_h
+        is_uv1_horizontal = abs(vec_uv_1.x) >= abs(vec_uv_1.y)
 
-        bmesh.update_edit_mesh(main_obj.data)
+        def comp_len(vec, axis):
+            if axis == 'x':
+                return abs(vec.x) if abs(vec.x) > eps else vec.length
+            else:
+                return abs(vec.y) if abs(vec.y) > eps else vec.length
 
-        # --- PASO 4: AUTO-STACK POR INTERSECCIÓN (OPCIONAL) ---
-        if props.auto_stack:
-            # Funciones internas para detectar islas y dimensiones
-            def get_islands(bm, uv_layer):
-                all_faces = set(bm.faces)
-                islands = []
-                while all_faces:
-                    face = all_faces.pop()
-                    island = {face}
-                    stack = [face]
-                    while stack:
-                        f = stack.pop()
-                        for edge in f.edges:
-                            for neighbor in edge.link_faces:
-                                if neighbor in all_faces:
-                                    is_joined = False
-                                    for l1 in f.loops:
-                                        if l1.edge == edge:
-                                            for l2 in neighbor.loops:
-                                                if l2.edge == edge:
-                                                    if (l1[uv_layer].uv - l2[uv_layer].uv).length < 0.0001:
-                                                        is_joined = True; break
-                                    if is_joined:
-                                        island.add(neighbor); stack.append(neighbor); all_faces.remove(neighbor)
-                    islands.append(island)
-                return islands
+        if is_uv1_horizontal:
+            target_uv_len_u = (len_3d_1 * pixels_per_meter) / float(tex_w)
+            target_uv_len_v = (len_3d_2 * pixels_per_meter) / float(tex_h)
+            curr_uv_len_u = comp_len(vec_uv_1, 'x')
+            curr_uv_len_v = comp_len(vec_uv_2, 'y')
+        else:
+            target_uv_len_v = (len_3d_1 * pixels_per_meter) / float(tex_h)
+            target_uv_len_u = (len_3d_2 * pixels_per_meter) / float(tex_w)
+            curr_uv_len_v = comp_len(vec_uv_1, 'y')
+            curr_uv_len_u = comp_len(vec_uv_2, 'x')
 
-            def get_island_stats(island, uv_layer):
-                uvs = [l[uv_layer].uv for f in island for l in f.loops]
-                mi_u = min(u.x for u in uvs); ma_u = max(u.x for u in uvs)
-                mi_v = min(u.y for u in uvs); ma_v = max(u.y for u in uvs)
-                return {
-                    'min_u': mi_u, 'max_u': ma_u, 'min_v': mi_v, 'max_v': ma_v,
-                    'w': round(ma_u - mi_u, 5), 'h': round(ma_v - mi_v, 5),
-                    'min_corner': mathutils.Vector((mi_u, mi_v))
-                }
+        if 'curr_uv_len_u' not in locals():
+            curr_uv_len_u = comp_len(vec_uv_1, 'x') if is_uv1_horizontal else comp_len(vec_uv_2, 'x')
+        if 'curr_uv_len_v' not in locals():
+            curr_uv_len_v = comp_len(vec_uv_2, 'y') if is_uv1_horizontal else comp_len(vec_uv_1, 'y')
 
-            bm.faces.ensure_lookup_table()
-            islands = get_islands(bm, uv_layer)
-            stats = [get_island_stats(isl, uv_layer) for isl in islands]
-            
-            for i in range(len(stats)):
-                for j in range(i + 1, len(stats)):
-                    A = stats[i]
-                    B = stats[j]
-                    
-                    # Detección de colisión AABB
-                    overlap = not (A['max_u'] < B['min_u'] or A['min_u'] > B['max_u'] or 
-                                   A['max_v'] < B['min_v'] or A['min_v'] > B['max_v'])
-                    
-                    if overlap:
-                        if abs(A['w'] - B['w']) < 0.001 and abs(A['h'] - B['h']) < 0.001:
-                            diff = A['min_corner'] - B['min_corner']
-                            for f in islands[j]:
-                                for l in f.loops:
-                                    l[uv_layer].uv += diff
-                            
-                            B['min_corner'] += diff
-                            B['min_u'] += diff.x; B['max_u'] += diff.x
-                            B['min_v'] += diff.y; B['max_v'] += diff.y
+        scale_u = target_uv_len_u / (curr_uv_len_u if curr_uv_len_u > eps else eps)
+        scale_v = target_uv_len_v / (curr_uv_len_v if curr_uv_len_v > eps else eps)
 
-        # --- AJUSTE AL LIENZO ---
-        bmesh.update_edit_mesh(main_obj.data); curu, curv = [l[uv_layer].uv.x for f in bm.faces for l in f.loops], [l[uv_layer].uv.y for f in bm.faces for l in f.loops]
-        offu, offv = -min(curu) if min(curu) < 0 else (1.0 - max(curu) if max(curu) > 1.0 else 0), -min(curv) if min(curv) < 0 else (1.0 - max(curv) if max(curv) > 1.0 else 0)
-        if offu != 0.0 or offv != 0.0:
-            for face in bm.faces:
-                for loop in face.loops: loop[uv_layer].uv.x += offu; loop[uv_layer].uv.y += offv
-        bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
-        self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
+        # ---------- APLICAR ESCALA A TODAS LAS UVs ----------
+        # recolectar lista global de referencias a UVs (mantener orden por objeto para update)
+        global_uvs = []
+        per_obj_uvs = {}  # obj -> list(uv refs)
+        for obj, bm in bm_map.items():
+            uv_layer = bm.loops.layers.uv.active
+            uvs = [loop[uv_layer].uv for face in bm.faces for loop in face.loops]
+            per_obj_uvs[obj] = uvs
+            global_uvs.extend(uvs)
 
-# --- VARIABLES DE CONTROL ---
+        # Aplicar scale uniforme a cada UV (manteniendo su offset relativo)
+        for uv in global_uvs:
+            uv.x *= scale_u
+            uv.y *= scale_v
+
+        # ---------- SNAP GLOBAL (si está activado): mantener posiciones relativas ----------
+        if props.snap_uvs and global_uvs:
+            min_u_px = min((uv.x * tex_w) for uv in global_uvs)
+            min_v_px = min((uv.y * tex_h) for uv in global_uvs)
+            target_min_u_px = round_px(min_u_px)
+            target_min_v_px = round_px(min_v_px)
+            delta_u = (target_min_u_px - min_u_px) / float(tex_w)
+            delta_v = (target_min_v_px - min_v_px) / float(tex_h)
+            # aplicar traslación global coherente
+            for uv in global_uvs:
+                uv.x += delta_u
+                uv.y += delta_v
+            # luego redondeo por UV a píxel
+            for uv in global_uvs:
+                uv.x = round_px(uv.x * tex_w) / float(tex_w)
+                uv.y = round_px(uv.y * tex_h) / float(tex_h)
+
+        # ---------- Constrain global: Solo si cabe en la textura ----------
+        constrain_uvs_to_bounds(global_uvs)
+
+        # ---------- Actualizaciones por objeto ----------
+        for obj, bm in bm_map.items():
+            # NOTA: Se eliminó el bucle de "clamp" que forzaba 0..1 y deformaba los bordes.
+            bmesh.update_edit_mesh(obj.data)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.report({'INFO'}, "Pixel Perfect aplicado (Tiling permitido).")
+        return {'FINISHED'}
+        
 # --- VARIABLES DE CONTROL ---
 _last_processed_mat = None
 _is_updating = False
 
+def get_collection_meshes(props):
+    """Obtiene todos los objetos MESH de la colección seleccionada."""
+    if props.target_collection:
+        return [obj for obj in props.target_collection.objects if obj.type == 'MESH']
+    return []
+
 def update_material_texture(self, context):
     """
-    Gestor de Texturas (Push/Pull):
-    - Al pulsar X: Corta los cables inmediatamente y limpia memoria.
-    - Al elegir imagen: Crea/Conecta el nodo.
-    - Al cambiar material: Carga la textura que tenga ese material.
+    Gestor Directo:
+    - Si target_image es None -> CORTAR CABLES (Remove Link).
+    - Si target_image es Imagen -> CONECTAR CABLES.
     """
     global _last_processed_mat, _is_updating
     
     if _is_updating: return
 
     mat = self.target_material
-    obj = context.active_object
+    
+    # 1. OBTENER OBJETOS
+    target_meshes = get_collection_meshes(self)
+    
+    # 2. APLICAR MATERIAL A LA COLECCIÓN
+    if target_meshes:
+        for obj in target_meshes:
+            if mat:
+                if not obj.data.materials:
+                    obj.data.materials.append(mat)
+                elif obj.active_material != mat:
+                    obj.active_material = mat
+            else:
+                if obj.data.materials:
+                    obj.data.materials.clear()
 
-    # Asignar material al objeto activo
-    if obj and obj.type == 'MESH' and mat:
-        if not obj.data.materials:
-            obj.data.materials.append(mat)
-        elif obj.active_material != mat:
-            obj.active_material = mat
-
-    if not mat or not mat.use_nodes:
+    if not mat:
         _last_processed_mat = None
+        if self.target_image is not None:
+             self.target_image = None
         return
 
+    # 3. PREPARAR NODOS
+    if not mat.use_nodes: mat.use_nodes = True
     tree = mat.node_tree
-    # Buscamos el nodo BSDF (compatible con Blender 3.6 y 4.0+)
     bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
     if not bsdf: return
 
-    # --- FASE 1: DETECTAR CAMBIO DE MATERIAL (PULL) ---
+    # --- FASE 1: DETECTAR SI CAMBIAMOS DE MATERIAL (PULL) ---
     if mat != _last_processed_mat:
         _last_processed_mat = mat
         _is_updating = True
         try:
-            # Verificamos si hay un nodo de imagen conectado al Base Color
+            # Leemos qué tiene conectado el material nuevo
             tex_image = None
             if bsdf.inputs['Base Color'].is_linked:
-                link = bsdf.inputs['Base Color'].links[0]
-                if link.from_node.type == 'TEX_IMAGE':
-                    tex_image = link.from_node.image
+                # Obtenemos el nodo conectado
+                node = bsdf.inputs['Base Color'].links[0].from_node
+                if node.type == 'TEX_IMAGE':
+                    tex_image = node.image
             
-            # Sincronizamos el menú con lo que acabamos de encontrar
             if self.target_image != tex_image:
                 self.target_image = tex_image
         finally:
             _is_updating = False
         return
 
-    # --- FASE 2: ACCIÓN DEL USUARIO EN EL MENÚ (PUSH) ---
-
-    # CASO A: PULSAR LA "X" (DESCONECTAR)
+    # --- FASE 2: ACCIÓN DEL USUARIO (PUSH) ---
+    
+    # CASO A: EL USUARIO PULSÓ LA X (UNLINK DIRECTO)
     if self.target_image is None:
-        # 1. Cortar todas las conexiones al Base Color que vengan de nodos de imagen
-        for link in bsdf.inputs['Base Color'].links:
-            if link.from_node.type == 'TEX_IMAGE':
-                tree.links.remove(link)
+        # 1. Desconectar Color (Directo, sin preguntar)
+        if bsdf.inputs['Base Color'].is_linked:
+            link = bsdf.inputs['Base Color'].links[0]
+            tree.links.remove(link) # <--- AQUÍ ESTÁ EL REMOVE LINK PURO
         
-        # 2. Cortar todas las conexiones al Alpha
-        if 'Alpha' in bsdf.inputs:
-            for link in bsdf.inputs['Alpha'].links:
-                if link.from_node.type == 'TEX_IMAGE':
-                    tree.links.remove(link)
+        # 2. Desconectar Alfa (Directo)
+        if 'Alpha' in bsdf.inputs and bsdf.inputs['Alpha'].is_linked:
+            link = bsdf.inputs['Alpha'].links[0]
+            tree.links.remove(link) # <--- AQUÍ TAMBIÉN
         
-        # 3. Forzar al sistema a olvidar este material para que el Monitor de la UI
-        # se resetee y no intente restaurar la imagen.
-        _last_processed_mat = None
-        
-        # 4. Refrescar interfaz
-        for area in context.screen.areas:
-            area.tag_redraw()
+        # 3. Actualizar Viewport inmediatamente
+        for obj in target_meshes:
+            obj.update_tag()
+            
+        # Forzar redibujado de la UI
+        context.area.tag_redraw()
         return
 
     # CASO B: ASIGNAR TEXTURA (CONECTAR)
-    # Buscamos un nodo de imagen existente o creamos uno
+    # Buscamos o creamos el nodo
     tex_node = next((n for n in tree.nodes if n.type == 'TEX_IMAGE'), None)
     if not tex_node:
         tex_node = tree.nodes.new('ShaderNodeTexImage')
         tex_node.location = (-300, 300)
 
-    # Actualizamos la imagen del nodo
-    tex_node.image = self.target_image
+    # Asignamos imagen
+    if tex_node.image != self.target_image:
+        tex_node.image = self.target_image
     
-    # Aseguramos los cables
-    if not bsdf.inputs['Base Color'].is_linked or bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+    # Aseguramos conexión Color
+    if not bsdf.inputs['Base Color'].is_linked:
+        tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+    elif bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+        # Si hay algo conectado que NO es nuestro nodo, lo reemplazamos
         tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
     
+    # Aseguramos conexión Alfa
     if 'Alpha' in bsdf.inputs:
-        if not bsdf.inputs['Alpha'].is_linked or bsdf.inputs['Alpha'].links[0].from_node != tex_node:
-            tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-
-def update_target_texture(self, context):
-    """
-    Callback: Aplica la imagen seleccionada al nodo de textura del 'target_material'.
-    Ya no iteramos objetos, modificamos directamente el material compartido.
-    """
-    target_img = self.target_image
-    mat = self.target_material # Usamos el material global seleccionado
+        if not bsdf.inputs['Alpha'].is_linked:
+             tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
     
-    if not target_img or not mat: return
-    
-    # --- Configuración de Nodos del Material ---
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    
-    # 1. Buscar o Crear Principled BSDF
-    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    if not bsdf:
-        nodes.clear() # Limpiamos si estaba sucio
-        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 0)
-        out = nodes.new('ShaderNodeOutputMaterial')
-        out.location = (300, 0)
-        links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    
-    # 2. Buscar o Crear Nodo de Imagen
-    tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
-    if not tex_node:
-        tex_node = nodes.new('ShaderNodeTexImage')
-        tex_node.location = (-300, 200)
-    
-    # 3. Asignar Imagen y Configurar
-    tex_node.image = target_img
-    tex_node.interpolation = 'Closest' # Pixel Art style
-    
-    # 4. Conectar
-    if 'Base Color' in bsdf.inputs:
-        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-    if 'Alpha' in bsdf.inputs:
-        links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+    for obj in target_meshes:
+        obj.update_tag()
         
     # 5. Configurar Transparencia
     mat.blend_method = 'CLIP'
@@ -1800,7 +1866,7 @@ class HytaleProperties(bpy.types.PropertyGroup):
         name="Textura del Modelo",
         type=bpy.types.Image,
         description="Selecciona la imagen/textura que usará este modelo",
-        update=update_target_texture
+        update=update_material_texture
     )
     # ---------------------------------------
 
@@ -2112,17 +2178,32 @@ class OPS_OT_DetectTexture(bpy.types.Operator):
             
         return {'FINISHED'}
         
-# --- MEMORIA ESTRICTA ---
-# Guardamos el estado del nodo por material.
-# Solo actualizamos el menú si el NODO cambia respecto a esta memoria.
-_node_state_cache = {}
-_last_viewed_mat = None
+# --- MEMORIA DEL MONITOR UI ---
+_node_cache_state = {}
+_ui_last_mat = None
+_ui_last_obj_mat = None
+_ui_last_collection = None
 
-def sync_menu_from_node(props, image):
+def sync_ui_task(props, img):
     try:
-        if props.target_image != image:
-            props.target_image = image
+        if props.target_image != img:
+            props.target_image = img
     except: pass
+    return None
+
+def sync_material_task(props, mat):
+    try:
+        if props.target_material != mat:
+            props.target_material = mat
+    except: pass
+    return None
+
+def get_collection_object(props):
+    """Busca un objeto MESH válido en la colección para monitorear."""
+    if props.target_collection:
+        for obj in props.target_collection.objects:
+            if obj.type == 'MESH':
+                return obj
     return None
 
 class PT_HytalePanel(bpy.types.Panel):
@@ -2133,50 +2214,71 @@ class PT_HytalePanel(bpy.types.Panel):
     bl_category = 'Hytale'
 
     def draw(self, context):
-        global _last_viewed_mat
+        global _ui_last_mat, _ui_last_obj_mat, _ui_last_collection
+        
         layout = self.layout
         props = context.scene.hytale_props
         
-        # 1. ANALIZAR ESTADO DE CONEXIÓN REAL
-        current_node_image = None
-        is_node_connected = False
+        # OBJETO MONITOR (Líder de la colección)
+        target_obj = get_collection_object(props)
+        
+        # --- 1. MONITOR DE MATERIALES ---
+        if target_obj:
+            real_active_mat = target_obj.active_material
+            
+            # Detectar cambio de colección
+            collection_changed = (props.target_collection != _ui_last_collection)
+            if collection_changed:
+                _ui_last_collection = props.target_collection
+            
+            # Sincronizar si el material real difiere del menú
+            if real_active_mat != props.target_material:
+                if collection_changed or real_active_mat != _ui_last_obj_mat:
+                    bpy.app.timers.register(lambda: sync_material_task(props, real_active_mat), first_interval=0.01)
+                    _ui_last_obj_mat = real_active_mat
+            else:
+                _ui_last_obj_mat = real_active_mat
+        else:
+            _ui_last_obj_mat = None
+        # --------------------------------
+
+        # 2. ESTADO REAL DE TEXTURA (NODOS)
+        real_img = None
+        connected = False
         mat = props.target_material
 
         if mat and mat.use_nodes:
             tree = mat.node_tree
             bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-            # La clave es 'is_linked': si no hay cable, para el menú no hay textura
             if bsdf and bsdf.inputs['Base Color'].is_linked:
                 link_node = bsdf.inputs['Base Color'].links[0].from_node
                 if link_node.type == 'TEX_IMAGE':
-                    is_node_connected = True
-                    current_node_image = link_node.image
+                    connected = True
+                    real_img = link_node.image
 
-        # 2. MONITOR DE CABLES (Tiempo Real)
+        # 3. MONITOR DE CABLES
         if mat:
-            mat_name = mat.name
-            cached_image = _node_state_cache.get(mat_name)
+            mat_id = mat.name
+            cached = _node_cache_state.get(mat_id, "NONE_SENTINEL")
             
-            if mat != _last_viewed_mat:
-                _node_state_cache[mat_name] = current_node_image
-                _last_viewed_mat = mat
-            
-            elif current_node_image != cached_image:
-                # Si el cable se cortó o cambió, sincronizamos el menú
-                bpy.app.timers.register(lambda: sync_menu_from_node(props, current_node_image), first_interval=0.01)
-                _node_state_cache[mat_name] = current_node_image
+            if mat != _ui_last_mat:
+                _node_cache_state[mat_id] = real_img
+                _ui_last_mat = mat
+            elif real_img != cached:
+                bpy.app.timers.register(lambda: sync_ui_task(props, real_img), first_interval=0.01)
+                _node_cache_state[mat_id] = real_img
 
-        # DIAGNÓSTICO
+        # --- INTERFAZ ---
         try: draw_validator_ui(self, context, layout)
         except: pass
         
-        # IMPORTAR
+        # Importar
         box = layout.box()
         box.label(text="Importar (Blockymodel):", icon='IMPORT')
         box.operator("hytale.import_model", icon='FILE_FOLDER', text="Cargar Modelo")
         layout.separator()
         
-        # UTILIDADES
+        # Utilidades
         box = layout.box()
         box.label(text="Utilidades & Referencias:", icon='TOOL_SETTINGS')
         row = box.row(align=True)
@@ -2184,7 +2286,7 @@ class PT_HytalePanel(bpy.types.Panel):
         row.operator("hytale.load_reference", icon='IMPORT', text="Cargar")
         layout.separator()
         
-        # ESCENA
+        # Escena
         box_main = layout.box()
         box_main.label(text="Configuración de Escena", icon='PREFERENCES')
         box_main.separator()
@@ -2193,6 +2295,8 @@ class PT_HytalePanel(bpy.types.Panel):
         has_collection = props.target_collection is not None
         if not has_collection:
             box_main.label(text="¡Selecciona colección para editar!", icon='INFO')
+        elif not target_obj:
+            box_main.label(text="Colección vacía (Sin MESH)", icon='ERROR')
         
         row = box_main.row(align=True)
         box_main.prop(props, "setup_pixel_grid", text="Modo Pixel Perfect")
@@ -2202,18 +2306,16 @@ class PT_HytalePanel(bpy.types.Panel):
 
         layout.separator()
 
-        # --- MATERIAL Y TEXTURA ---
+        # Material
         box_mat = layout.box()
         box_mat.label(text="Material y Textura", icon='MATERIAL')
-        box_mat.enabled = has_collection
+        box_mat.enabled = has_collection and (target_obj is not None)
         
         col = box_mat.column(align=True)
         col.template_ID(props, "target_material", new="material.new")
         
         if props.target_material:
             col.separator()
-            
-            # Selector Principal
             row = col.row(align=True)
             row.template_ID(props, "target_image", new="image.new", open="image.open")
             row.operator("hytale.detect_texture", icon='EYEDROPPER', text="")
@@ -2225,33 +2327,33 @@ class PT_HytalePanel(bpy.types.Panel):
             else:
                 row = col.row()
                 row.alignment = 'CENTER'
-                row.label(text="Asigna una textura", icon='INFO')
+                row.label(text="Sin textura (Desconectado)", icon='INFO')
         else:
-            col.label(text="Selecciona Material Unificado", icon='ERROR')
+            col.label(text="Sin Material Seleccionado", icon='ERROR')
 
         layout.separator()
 
-        # UV Y EXPORTACIÓN
-        box = layout.box()
-        row_uv = box.row()
-        row_uv.label(text="Herramientas UV:", icon='UV_DATA')
+        # UV / Export
+        is_uv_enabled = has_collection and connected and target_obj
         
-        # Activamos herramientas si hay textura en el NODO (independiente del menú)
-        is_uv_enabled = has_collection and is_node_connected and current_node_image
-        box.enabled = bool(is_uv_enabled)
+        box_uv = layout.box()
+        box_uv.enabled = bool(is_uv_enabled)
+        box_uv.label(text="Herramientas UV:", icon='UV_DATA')
         
         if not is_uv_enabled:
+             # --- AQUI ESTABA EL ERROR: CAMBIADO A 'TRIA_RIGHT' ---
              if not has_collection:
-                 box.label(text="(Requiere Colección)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
-             elif not is_node_connected:
-                 box.label(text="(Falta Textura)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
+                 box_uv.label(text="(Requiere Colección)", icon='TRIA_RIGHT')
+             elif not connected:
+                 box_uv.label(text="(Falta Textura)", icon='TRIA_RIGHT')
+             # -----------------------------------------------------
 
-        box.prop(props, "new_unwrap")
-        box.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
-        box.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
+        box_uv.prop(props, "new_unwrap")
+        box_uv.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
+        box_uv.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
         
         is_active = context.scene.hytale_uv_active
-        box.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
+        box_uv.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
         
         layout.separator()
 
