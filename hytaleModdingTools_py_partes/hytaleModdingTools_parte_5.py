@@ -1,6 +1,69 @@
 # PARTE 5/5 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+                    
+                    if not is_face_selected: continue
+
+                    uvs = [l[uv_layer].uv for l in face.loops]
+                    if not uvs: continue
+                    
+                    min_u, max_u = min(u.x for u in uvs), max(u.x for u in uvs)
+                    min_v, max_v = min(u.y for u in uvs), max(u.y for u in uvs)
+                    
+                    w_px = (max_u - min_u) * tex_w
+                    h_px = (max_v - min_v) * tex_h
+
+                    cx_center, cy_center = uv_to_region((min_u + max_u)/2, (min_v + max_v)/2)
+                    dist_target = ((cx_center - target_x)**2 + (cy_center - target_y)**2)**0.5
+
+                    cx_w, cy_w = uv_to_region((min_u + max_u)/2, min_v)
+                    cx_h, cy_h = uv_to_region(min_u, (min_v + max_v)/2)
+
+                    unique_id = (obj.name, 'FACE', face.index)
+                    if unique_id not in candidates: candidates[unique_id] = []
+                    candidates[unique_id].append( (dist_target, cx_w, cy_w, cx_h, cy_h, w_px, h_px) )
+
+        except Exception:
+            continue
+        finally:
+            if bm: bm.free()
+
+    # --- DIBUJADO FINAL ---
+    for uid, locations in candidates.items():
+        # Ordenamos por cercanía al último clic
+        locations.sort(key=lambda x: x[0])
+        best_match = locations[0]
+        
+        if uid[1] == 'EDGE':
+            _, sx, sy, text = best_match
+            blf.position(font_id, sx, sy, 0)
+            blf.draw(font_id, text)
+            
+        elif uid[1] == 'FACE':
+            _, cx_w, cy_w, cx_h, cy_h, w_px, h_px = best_match
+            blf.position(font_id, cx_w, cy_w - 20, 0)
+            blf.draw(font_id, f"W: {w_px:.1f}")
+            blf.position(font_id, cx_h - 50, cy_h, 0)
+            blf.draw(font_id, f"H: {h_px:.1f}")
+
+class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
+    """Activa medidas UV, Sync, Modo Caras y Selecciona Todo"""
+    bl_idname = "hytale.toggle_uv_measures"
+    bl_label = "Ver Medidas UV (Full Setup)"
+    
+    def force_uv_redraw(self, context):
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'IMAGE_EDITOR':
+                    area.tag_redraw()
+    
+    def modal(self, context, event):
+        global uv_measures_running, last_click_abs_x, last_click_abs_y, draw_handle_uv_stats
+        
+        if not uv_measures_running:
+            if draw_handle_uv_stats:
+                bpy.types.SpaceImageEditor.draw_handler_remove(draw_handle_uv_stats, 'WINDOW')
+                draw_handle_uv_stats = None
             
             context.scene.hytale_uv_active = False
             self.force_uv_redraw(context)
@@ -102,17 +165,32 @@ class OPS_OT_DetectTexture(bpy.types.Operator):
             
         return {'FINISHED'}
         
-# --- MEMORIA ESTRICTA ---
-# Guardamos el estado del nodo por material.
-# Solo actualizamos el menú si el NODO cambia respecto a esta memoria.
-_node_state_cache = {}
-_last_viewed_mat = None
+# --- MEMORIA DEL MONITOR UI ---
+_node_cache_state = {}
+_ui_last_mat = None
+_ui_last_obj_mat = None
+_ui_last_collection = None
 
-def sync_menu_from_node(props, image):
+def sync_ui_task(props, img):
     try:
-        if props.target_image != image:
-            props.target_image = image
+        if props.target_image != img:
+            props.target_image = img
     except: pass
+    return None
+
+def sync_material_task(props, mat):
+    try:
+        if props.target_material != mat:
+            props.target_material = mat
+    except: pass
+    return None
+
+def get_collection_object(props):
+    """Busca un objeto MESH válido en la colección para monitorear."""
+    if props.target_collection:
+        for obj in props.target_collection.objects:
+            if obj.type == 'MESH':
+                return obj
     return None
 
 class PT_HytalePanel(bpy.types.Panel):
@@ -123,50 +201,71 @@ class PT_HytalePanel(bpy.types.Panel):
     bl_category = 'Hytale'
 
     def draw(self, context):
-        global _last_viewed_mat
+        global _ui_last_mat, _ui_last_obj_mat, _ui_last_collection
+        
         layout = self.layout
         props = context.scene.hytale_props
         
-        # 1. ANALIZAR ESTADO DE CONEXIÓN REAL
-        current_node_image = None
-        is_node_connected = False
+        # OBJETO MONITOR (Líder de la colección)
+        target_obj = get_collection_object(props)
+        
+        # --- 1. MONITOR DE MATERIALES ---
+        if target_obj:
+            real_active_mat = target_obj.active_material
+            
+            # Detectar cambio de colección
+            collection_changed = (props.target_collection != _ui_last_collection)
+            if collection_changed:
+                _ui_last_collection = props.target_collection
+            
+            # Sincronizar si el material real difiere del menú
+            if real_active_mat != props.target_material:
+                if collection_changed or real_active_mat != _ui_last_obj_mat:
+                    bpy.app.timers.register(lambda: sync_material_task(props, real_active_mat), first_interval=0.01)
+                    _ui_last_obj_mat = real_active_mat
+            else:
+                _ui_last_obj_mat = real_active_mat
+        else:
+            _ui_last_obj_mat = None
+        # --------------------------------
+
+        # 2. ESTADO REAL DE TEXTURA (NODOS)
+        real_img = None
+        connected = False
         mat = props.target_material
 
         if mat and mat.use_nodes:
             tree = mat.node_tree
             bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-            # La clave es 'is_linked': si no hay cable, para el menú no hay textura
             if bsdf and bsdf.inputs['Base Color'].is_linked:
                 link_node = bsdf.inputs['Base Color'].links[0].from_node
                 if link_node.type == 'TEX_IMAGE':
-                    is_node_connected = True
-                    current_node_image = link_node.image
+                    connected = True
+                    real_img = link_node.image
 
-        # 2. MONITOR DE CABLES (Tiempo Real)
+        # 3. MONITOR DE CABLES
         if mat:
-            mat_name = mat.name
-            cached_image = _node_state_cache.get(mat_name)
+            mat_id = mat.name
+            cached = _node_cache_state.get(mat_id, "NONE_SENTINEL")
             
-            if mat != _last_viewed_mat:
-                _node_state_cache[mat_name] = current_node_image
-                _last_viewed_mat = mat
-            
-            elif current_node_image != cached_image:
-                # Si el cable se cortó o cambió, sincronizamos el menú
-                bpy.app.timers.register(lambda: sync_menu_from_node(props, current_node_image), first_interval=0.01)
-                _node_state_cache[mat_name] = current_node_image
+            if mat != _ui_last_mat:
+                _node_cache_state[mat_id] = real_img
+                _ui_last_mat = mat
+            elif real_img != cached:
+                bpy.app.timers.register(lambda: sync_ui_task(props, real_img), first_interval=0.01)
+                _node_cache_state[mat_id] = real_img
 
-        # DIAGNÓSTICO
+        # --- INTERFAZ ---
         try: draw_validator_ui(self, context, layout)
         except: pass
         
-        # IMPORTAR
+        # Importar
         box = layout.box()
         box.label(text="Importar (Blockymodel):", icon='IMPORT')
         box.operator("hytale.import_model", icon='FILE_FOLDER', text="Cargar Modelo")
         layout.separator()
         
-        # UTILIDADES
+        # Utilidades
         box = layout.box()
         box.label(text="Utilidades & Referencias:", icon='TOOL_SETTINGS')
         row = box.row(align=True)
@@ -174,7 +273,7 @@ class PT_HytalePanel(bpy.types.Panel):
         row.operator("hytale.load_reference", icon='IMPORT', text="Cargar")
         layout.separator()
         
-        # ESCENA
+        # Escena
         box_main = layout.box()
         box_main.label(text="Configuración de Escena", icon='PREFERENCES')
         box_main.separator()
@@ -183,6 +282,8 @@ class PT_HytalePanel(bpy.types.Panel):
         has_collection = props.target_collection is not None
         if not has_collection:
             box_main.label(text="¡Selecciona colección para editar!", icon='INFO')
+        elif not target_obj:
+            box_main.label(text="Colección vacía (Sin MESH)", icon='ERROR')
         
         row = box_main.row(align=True)
         box_main.prop(props, "setup_pixel_grid", text="Modo Pixel Perfect")
@@ -192,18 +293,16 @@ class PT_HytalePanel(bpy.types.Panel):
 
         layout.separator()
 
-        # --- MATERIAL Y TEXTURA ---
+        # Material
         box_mat = layout.box()
         box_mat.label(text="Material y Textura", icon='MATERIAL')
-        box_mat.enabled = has_collection
+        box_mat.enabled = has_collection and (target_obj is not None)
         
         col = box_mat.column(align=True)
         col.template_ID(props, "target_material", new="material.new")
         
         if props.target_material:
             col.separator()
-            
-            # Selector Principal
             row = col.row(align=True)
             row.template_ID(props, "target_image", new="image.new", open="image.open")
             row.operator("hytale.detect_texture", icon='EYEDROPPER', text="")
@@ -215,33 +314,33 @@ class PT_HytalePanel(bpy.types.Panel):
             else:
                 row = col.row()
                 row.alignment = 'CENTER'
-                row.label(text="Asigna una textura", icon='INFO')
+                row.label(text="Sin textura (Desconectado)", icon='INFO')
         else:
-            col.label(text="Selecciona Material Unificado", icon='ERROR')
+            col.label(text="Sin Material Seleccionado", icon='ERROR')
 
         layout.separator()
 
-        # UV Y EXPORTACIÓN
-        box = layout.box()
-        row_uv = box.row()
-        row_uv.label(text="Herramientas UV:", icon='UV_DATA')
+        # UV / Export
+        is_uv_enabled = has_collection and connected and target_obj
         
-        # Activamos herramientas si hay textura en el NODO (independiente del menú)
-        is_uv_enabled = has_collection and is_node_connected and current_node_image
-        box.enabled = bool(is_uv_enabled)
+        box_uv = layout.box()
+        box_uv.enabled = bool(is_uv_enabled)
+        box_uv.label(text="Herramientas UV:", icon='UV_DATA')
         
         if not is_uv_enabled:
+             # --- AQUI ESTABA EL ERROR: CAMBIADO A 'TRIA_RIGHT' ---
              if not has_collection:
-                 box.label(text="(Requiere Colección)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
-             elif not is_node_connected:
-                 box.label(text="(Falta Textura)", icon='SMALL_TRIANGLE_RIGHT_DOWN')
+                 box_uv.label(text="(Requiere Colección)", icon='TRIA_RIGHT')
+             elif not connected:
+                 box_uv.label(text="(Falta Textura)", icon='TRIA_RIGHT')
+             # -----------------------------------------------------
 
-        box.prop(props, "new_unwrap")
-        box.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
-        box.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
+        box_uv.prop(props, "new_unwrap")
+        box_uv.prop(props, "auto_stack", text="Auto Stack Similar UV Islands")
+        box_uv.operator("hytale.pixel_perfect_pack", icon='UV_SYNC_SELECT', text="Pixel Perfect Pack")
         
         is_active = context.scene.hytale_uv_active
-        box.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
+        box_uv.operator("hytale.toggle_uv_measures", icon="DRIVER_DISTANCE", text="Mostrar Medidas En UV's", depress=is_active)
         
         layout.separator()
 

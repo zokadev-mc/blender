@@ -2,257 +2,329 @@
 # CAMBIOS RECIENTES
 
 
-        # --- PASO 2: ALINEACIÓN (API Moderna) ---
-        area_uv = next((a for a in context.screen.areas if a.type == 'IMAGE_EDITOR'), None)
-        if area_uv:
-            with context.temp_override(area=area_uv):
-                try: 
-                    bpy.ops.uv.select_all(action='SELECT')
-                    bpy.ops.uv.align_rotation(method='AUTO', correct_aspect=True)
-                except: pass
-        
-        bmesh.update_edit_mesh(main_obj.data)
+        # Lógica de resolución: Prioridad al menú, luego al JSON
+        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 32)
+        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 32)
 
-        # --- PASO 3: ESCALADO PIXEL PERFECT ---
-        all_loops = [l for f in bm.faces for l in f.loops]
-        if not all_loops:
+        model_name = os.path.splitext(os.path.basename(self.filepath))[0]
+        col = bpy.data.collections.new(model_name)
+        context.scene.collection.children.link(col)
+
+        # Iniciar importación recursiva
+        for node in data.get("nodes", []):
+            process_node_import(node, None, tex_w, tex_h, col)
+
+        self.report({'INFO'}, f"Importado con resolución: {tex_w}x{tex_h}")
+        return {'FINISHED'}
+        
+# -------------------------
+# Operator: Pixel Perfect + Constrain to Image Bounds
+# -------------------------
+class OPS_OT_PixelPerfectPack(bpy.types.Operator):
+    bl_idname = "hytale.pixel_perfect_pack"
+    bl_label = "Scale UV's To Pixel Perfect"
+    bl_description = "Escala UVs a pixel-perfect y restringe la selección completa al lienzo 0..1 (no por-isla)."
+
+    def execute(self, context):
+        # Props & fallbacks
+        props = getattr(context.scene, "hytale_props", None)
+        if not props:
+            class _P:
+                new_unwrap = True
+                snap_uvs = True
+            props = _P()
+
+        def safe_get_image_size(objs):
+            try:
+                return get_image_size_from_objects(objs)
+            except Exception:
+                return 32, 32
+
+        def round_px(val_px):
+            return math.floor(val_px + 0.5)
+
+        def constrain_uvs_to_bounds(uvs):
+            """
+            Intenta meter las UVs en 0..1. 
+            IMPORTANTE: Si el bloque de UVs es más grande que 1.0 (tiling), 
+            se aborta la operación para no romper la densidad de píxeles.
+            """
+            if not uvs:
+                return
+
+            min_u = min(uv.x for uv in uvs)
+            max_u = max(uv.x for uv in uvs)
+            min_v = min(uv.y for uv in uvs)
+            max_v = max(uv.y for uv in uvs)
+            
+            width = max_u - min_u
+            height = max_v - min_v
+            eps = 1e-5 # Un margen pequeño pero seguro
+
+            # 1. CHECK DE TAMAÑO (La corrección principal)
+            # Si el bounding box total es mayor que el espacio 0..1,
+            # significa que necesitamos tiling. No restringimos.
+            if width > 1.0 + eps or height > 1.0 + eps:
+                return
+
+            # 2. Traslación (Shift) para meter bbox en 0..1 si cabe
+            # (No escalamos, solo movemos si se sale un poco pero cabe)
+            shift_u = 0.0
+            if min_u < 0.0:
+                shift_u = -min_u
+            elif max_u > 1.0:
+                shift_u = 1.0 - max_u
+            
+            shift_v = 0.0
+            if min_v < 0.0:
+                shift_v = -min_v
+            elif max_v > 1.0:
+                shift_v = 1.0 - max_v
+            
+            if shift_u != 0.0 or shift_v != 0.0:
+                for uv in uvs:
+                    uv.x += shift_u
+                    uv.y += shift_v
+
+        # -------------------------
+        # Inicio operator
+        # -------------------------
+        selected_meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        if not selected_meshes:
+            self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
+            return {'CANCELLED'}
+
+        tex_w, tex_h = safe_get_image_size(selected_meshes)
+        pixels_per_meter = 16.0
+        eps = 1e-8
+
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        # Construir bmesh por objeto y lista global de faces
+        bm_map = {}
+        all_faces = []
+        for obj in selected_meshes:
+            bm = bmesh.from_edit_mesh(obj.data)
+            if not bm.loops.layers.uv:
+                bm.loops.layers.uv.new()
+            bm.loops.layers.uv.verify()
+            bm_map[obj] = bm
+            for f in bm.faces:
+                all_faces.append((f, bm))
+
+        if not all_faces:
             bpy.ops.object.mode_set(mode='OBJECT')
             return {'FINISHED'}
 
-        min_u_global = min(l[uv_layer].uv.x for l in all_loops)
-        max_u_global = max(l[uv_layer].uv.x for l in all_loops)
-        min_v_global = min(l[uv_layer].uv.y for l in all_loops)
-        max_v_global = max(l[uv_layer].uv.y for l in all_loops)
+        # Pre-unwrap / align si corresponde
+        bpy.ops.mesh.select_all(action='SELECT')
+        if props.new_unwrap:
+            try:
+                bpy.ops.uv.unwrap(method='CONFORMAL', margin=0.001)
+            except Exception:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
 
-        dominant_face = max(bm.faces, key=lambda f: f.calc_area())
-        v0, v1, v3 = dominant_face.loops[0].vert.co, dominant_face.loops[1].vert.co, dominant_face.loops[-1].vert.co
-        w_3d = (v1 - v0).length
-        h_3d = (v3 - v0).length
+        # Cara dominante (usar para cálculo de escala uniforme)
+        dom_face, dom_bm = max(all_faces, key=lambda it: it[0].calc_area())
+        uv_layer_active = dom_bm.loops.layers.uv.active
 
-        uvs_dom = [l[uv_layer].uv for l in dominant_face.loops]
-        curr_w_uv = max(0.0001, max(u.x for u in uvs_dom) - min(u.x for u in uvs_dom))
-        curr_h_uv = max(0.0001, max(u.y for u in uvs_dom) - min(u.y for u in uvs_dom))
+        vec_3d_1 = dom_face.loops[1].vert.co - dom_face.loops[0].vert.co
+        vec_3d_2 = dom_face.loops[-1].vert.co - dom_face.loops[0].vert.co
+        len_3d_1 = vec_3d_1.length
+        len_3d_2 = vec_3d_2.length
 
-        scale_u = (w_3d * 16.0 / tex_w) / curr_w_uv
-        scale_v = (h_3d * 16.0 / tex_h) / curr_h_uv
+        uv0 = dom_face.loops[0][uv_layer_active].uv.copy()
+        uv1 = dom_face.loops[1][uv_layer_active].uv.copy()
+        uv3 = dom_face.loops[-1][uv_layer_active].uv.copy()
+        vec_uv_1 = uv1 - uv0
+        vec_uv_2 = uv3 - uv0
 
-        pivot = mathutils.Vector(((min_u_global + max_u_global) / 2.0, (min_v_global + max_v_global) / 2.0))
-        for f in bm.faces:
-            for l in f.loops:
-                l[uv_layer].uv.x = pivot.x + (l[uv_layer].uv.x - pivot.x) * scale_u
-                l[uv_layer].uv.y = pivot.y + (l[uv_layer].uv.y - pivot.y) * scale_v
-                if props.snap_uvs:
-                    l[uv_layer].uv.x = round(l[uv_layer].uv.x * tex_w) / tex_w
-                    l[uv_layer].uv.y = round(l[uv_layer].uv.y * tex_h) / tex_h
+        is_uv1_horizontal = abs(vec_uv_1.x) >= abs(vec_uv_1.y)
 
-        bmesh.update_edit_mesh(main_obj.data)
+        def comp_len(vec, axis):
+            if axis == 'x':
+                return abs(vec.x) if abs(vec.x) > eps else vec.length
+            else:
+                return abs(vec.y) if abs(vec.y) > eps else vec.length
 
-        # --- PASO 4: AUTO-STACK POR INTERSECCIÓN (OPCIONAL) ---
-        if props.auto_stack:
-            # Funciones internas para detectar islas y dimensiones
-            def get_islands(bm, uv_layer):
-                all_faces = set(bm.faces)
-                islands = []
-                while all_faces:
-                    face = all_faces.pop()
-                    island = {face}
-                    stack = [face]
-                    while stack:
-                        f = stack.pop()
-                        for edge in f.edges:
-                            for neighbor in edge.link_faces:
-                                if neighbor in all_faces:
-                                    is_joined = False
-                                    for l1 in f.loops:
-                                        if l1.edge == edge:
-                                            for l2 in neighbor.loops:
-                                                if l2.edge == edge:
-                                                    if (l1[uv_layer].uv - l2[uv_layer].uv).length < 0.0001:
-                                                        is_joined = True; break
-                                    if is_joined:
-                                        island.add(neighbor); stack.append(neighbor); all_faces.remove(neighbor)
-                    islands.append(island)
-                return islands
+        if is_uv1_horizontal:
+            target_uv_len_u = (len_3d_1 * pixels_per_meter) / float(tex_w)
+            target_uv_len_v = (len_3d_2 * pixels_per_meter) / float(tex_h)
+            curr_uv_len_u = comp_len(vec_uv_1, 'x')
+            curr_uv_len_v = comp_len(vec_uv_2, 'y')
+        else:
+            target_uv_len_v = (len_3d_1 * pixels_per_meter) / float(tex_h)
+            target_uv_len_u = (len_3d_2 * pixels_per_meter) / float(tex_w)
+            curr_uv_len_v = comp_len(vec_uv_1, 'y')
+            curr_uv_len_u = comp_len(vec_uv_2, 'x')
 
-            def get_island_stats(island, uv_layer):
-                uvs = [l[uv_layer].uv for f in island for l in f.loops]
-                mi_u = min(u.x for u in uvs); ma_u = max(u.x for u in uvs)
-                mi_v = min(u.y for u in uvs); ma_v = max(u.y for u in uvs)
-                return {
-                    'min_u': mi_u, 'max_u': ma_u, 'min_v': mi_v, 'max_v': ma_v,
-                    'w': round(ma_u - mi_u, 5), 'h': round(ma_v - mi_v, 5),
-                    'min_corner': mathutils.Vector((mi_u, mi_v))
-                }
+        if 'curr_uv_len_u' not in locals():
+            curr_uv_len_u = comp_len(vec_uv_1, 'x') if is_uv1_horizontal else comp_len(vec_uv_2, 'x')
+        if 'curr_uv_len_v' not in locals():
+            curr_uv_len_v = comp_len(vec_uv_2, 'y') if is_uv1_horizontal else comp_len(vec_uv_1, 'y')
 
-            bm.faces.ensure_lookup_table()
-            islands = get_islands(bm, uv_layer)
-            stats = [get_island_stats(isl, uv_layer) for isl in islands]
-            
-            for i in range(len(stats)):
-                for j in range(i + 1, len(stats)):
-                    A = stats[i]
-                    B = stats[j]
-                    
-                    # Detección de colisión AABB
-                    overlap = not (A['max_u'] < B['min_u'] or A['min_u'] > B['max_u'] or 
-                                   A['max_v'] < B['min_v'] or A['min_v'] > B['max_v'])
-                    
-                    if overlap:
-                        if abs(A['w'] - B['w']) < 0.001 and abs(A['h'] - B['h']) < 0.001:
-                            diff = A['min_corner'] - B['min_corner']
-                            for f in islands[j]:
-                                for l in f.loops:
-                                    l[uv_layer].uv += diff
-                            
-                            B['min_corner'] += diff
-                            B['min_u'] += diff.x; B['max_u'] += diff.x
-                            B['min_v'] += diff.y; B['max_v'] += diff.y
+        scale_u = target_uv_len_u / (curr_uv_len_u if curr_uv_len_u > eps else eps)
+        scale_v = target_uv_len_v / (curr_uv_len_v if curr_uv_len_v > eps else eps)
 
-        # --- AJUSTE AL LIENZO ---
-        bmesh.update_edit_mesh(main_obj.data); curu, curv = [l[uv_layer].uv.x for f in bm.faces for l in f.loops], [l[uv_layer].uv.y for f in bm.faces for l in f.loops]
-        offu, offv = -min(curu) if min(curu) < 0 else (1.0 - max(curu) if max(curu) > 1.0 else 0), -min(curv) if min(curv) < 0 else (1.0 - max(curv) if max(curv) > 1.0 else 0)
-        if offu != 0.0 or offv != 0.0:
-            for face in bm.faces:
-                for loop in face.loops: loop[uv_layer].uv.x += offu; loop[uv_layer].uv.y += offv
-        bmesh.update_edit_mesh(main_obj.data); bpy.ops.mesh.separate(type='LOOSE'); bpy.ops.object.mode_set(mode='OBJECT')
-        self.report({'INFO'}, "Cube2D: Proceso Pixel Perfect finalizado."); return {'FINISHED'}
+        # ---------- APLICAR ESCALA A TODAS LAS UVs ----------
+        # recolectar lista global de referencias a UVs (mantener orden por objeto para update)
+        global_uvs = []
+        per_obj_uvs = {}  # obj -> list(uv refs)
+        for obj, bm in bm_map.items():
+            uv_layer = bm.loops.layers.uv.active
+            uvs = [loop[uv_layer].uv for face in bm.faces for loop in face.loops]
+            per_obj_uvs[obj] = uvs
+            global_uvs.extend(uvs)
 
-# --- VARIABLES DE CONTROL ---
+        # Aplicar scale uniforme a cada UV (manteniendo su offset relativo)
+        for uv in global_uvs:
+            uv.x *= scale_u
+            uv.y *= scale_v
+
+        # ---------- SNAP GLOBAL (si está activado): mantener posiciones relativas ----------
+        if props.snap_uvs and global_uvs:
+            min_u_px = min((uv.x * tex_w) for uv in global_uvs)
+            min_v_px = min((uv.y * tex_h) for uv in global_uvs)
+            target_min_u_px = round_px(min_u_px)
+            target_min_v_px = round_px(min_v_px)
+            delta_u = (target_min_u_px - min_u_px) / float(tex_w)
+            delta_v = (target_min_v_px - min_v_px) / float(tex_h)
+            # aplicar traslación global coherente
+            for uv in global_uvs:
+                uv.x += delta_u
+                uv.y += delta_v
+            # luego redondeo por UV a píxel
+            for uv in global_uvs:
+                uv.x = round_px(uv.x * tex_w) / float(tex_w)
+                uv.y = round_px(uv.y * tex_h) / float(tex_h)
+
+        # ---------- Constrain global: Solo si cabe en la textura ----------
+        constrain_uvs_to_bounds(global_uvs)
+
+        # ---------- Actualizaciones por objeto ----------
+        for obj, bm in bm_map.items():
+            # NOTA: Se eliminó el bucle de "clamp" que forzaba 0..1 y deformaba los bordes.
+            bmesh.update_edit_mesh(obj.data)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.report({'INFO'}, "Pixel Perfect aplicado (Tiling permitido).")
+        return {'FINISHED'}
+        
 # --- VARIABLES DE CONTROL ---
 _last_processed_mat = None
 _is_updating = False
 
+def get_collection_meshes(props):
+    """Obtiene todos los objetos MESH de la colección seleccionada."""
+    if props.target_collection:
+        return [obj for obj in props.target_collection.objects if obj.type == 'MESH']
+    return []
+
 def update_material_texture(self, context):
     """
-    Gestor de Texturas (Push/Pull):
-    - Al pulsar X: Corta los cables inmediatamente y limpia memoria.
-    - Al elegir imagen: Crea/Conecta el nodo.
-    - Al cambiar material: Carga la textura que tenga ese material.
+    Gestor Directo:
+    - Si target_image es None -> CORTAR CABLES (Remove Link).
+    - Si target_image es Imagen -> CONECTAR CABLES.
     """
     global _last_processed_mat, _is_updating
     
     if _is_updating: return
 
     mat = self.target_material
-    obj = context.active_object
+    
+    # 1. OBTENER OBJETOS
+    target_meshes = get_collection_meshes(self)
+    
+    # 2. APLICAR MATERIAL A LA COLECCIÓN
+    if target_meshes:
+        for obj in target_meshes:
+            if mat:
+                if not obj.data.materials:
+                    obj.data.materials.append(mat)
+                elif obj.active_material != mat:
+                    obj.active_material = mat
+            else:
+                if obj.data.materials:
+                    obj.data.materials.clear()
 
-    # Asignar material al objeto activo
-    if obj and obj.type == 'MESH' and mat:
-        if not obj.data.materials:
-            obj.data.materials.append(mat)
-        elif obj.active_material != mat:
-            obj.active_material = mat
-
-    if not mat or not mat.use_nodes:
+    if not mat:
         _last_processed_mat = None
+        if self.target_image is not None:
+             self.target_image = None
         return
 
+    # 3. PREPARAR NODOS
+    if not mat.use_nodes: mat.use_nodes = True
     tree = mat.node_tree
-    # Buscamos el nodo BSDF (compatible con Blender 3.6 y 4.0+)
     bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
     if not bsdf: return
 
-    # --- FASE 1: DETECTAR CAMBIO DE MATERIAL (PULL) ---
+    # --- FASE 1: DETECTAR SI CAMBIAMOS DE MATERIAL (PULL) ---
     if mat != _last_processed_mat:
         _last_processed_mat = mat
         _is_updating = True
         try:
-            # Verificamos si hay un nodo de imagen conectado al Base Color
+            # Leemos qué tiene conectado el material nuevo
             tex_image = None
             if bsdf.inputs['Base Color'].is_linked:
-                link = bsdf.inputs['Base Color'].links[0]
-                if link.from_node.type == 'TEX_IMAGE':
-                    tex_image = link.from_node.image
+                # Obtenemos el nodo conectado
+                node = bsdf.inputs['Base Color'].links[0].from_node
+                if node.type == 'TEX_IMAGE':
+                    tex_image = node.image
             
-            # Sincronizamos el menú con lo que acabamos de encontrar
             if self.target_image != tex_image:
                 self.target_image = tex_image
         finally:
             _is_updating = False
         return
 
-    # --- FASE 2: ACCIÓN DEL USUARIO EN EL MENÚ (PUSH) ---
-
-    # CASO A: PULSAR LA "X" (DESCONECTAR)
+    # --- FASE 2: ACCIÓN DEL USUARIO (PUSH) ---
+    
+    # CASO A: EL USUARIO PULSÓ LA X (UNLINK DIRECTO)
     if self.target_image is None:
-        # 1. Cortar todas las conexiones al Base Color que vengan de nodos de imagen
-        for link in bsdf.inputs['Base Color'].links:
-            if link.from_node.type == 'TEX_IMAGE':
-                tree.links.remove(link)
+        # 1. Desconectar Color (Directo, sin preguntar)
+        if bsdf.inputs['Base Color'].is_linked:
+            link = bsdf.inputs['Base Color'].links[0]
+            tree.links.remove(link) # <--- AQUÍ ESTÁ EL REMOVE LINK PURO
         
-        # 2. Cortar todas las conexiones al Alpha
-        if 'Alpha' in bsdf.inputs:
-            for link in bsdf.inputs['Alpha'].links:
-                if link.from_node.type == 'TEX_IMAGE':
-                    tree.links.remove(link)
+        # 2. Desconectar Alfa (Directo)
+        if 'Alpha' in bsdf.inputs and bsdf.inputs['Alpha'].is_linked:
+            link = bsdf.inputs['Alpha'].links[0]
+            tree.links.remove(link) # <--- AQUÍ TAMBIÉN
         
-        # 3. Forzar al sistema a olvidar este material para que el Monitor de la UI
-        # se resetee y no intente restaurar la imagen.
-        _last_processed_mat = None
-        
-        # 4. Refrescar interfaz
-        for area in context.screen.areas:
-            area.tag_redraw()
+        # 3. Actualizar Viewport inmediatamente
+        for obj in target_meshes:
+            obj.update_tag()
+            
+        # Forzar redibujado de la UI
+        context.area.tag_redraw()
         return
 
     # CASO B: ASIGNAR TEXTURA (CONECTAR)
-    # Buscamos un nodo de imagen existente o creamos uno
+    # Buscamos o creamos el nodo
     tex_node = next((n for n in tree.nodes if n.type == 'TEX_IMAGE'), None)
     if not tex_node:
         tex_node = tree.nodes.new('ShaderNodeTexImage')
         tex_node.location = (-300, 300)
 
-    # Actualizamos la imagen del nodo
-    tex_node.image = self.target_image
+    # Asignamos imagen
+    if tex_node.image != self.target_image:
+        tex_node.image = self.target_image
     
-    # Aseguramos los cables
-    if not bsdf.inputs['Base Color'].is_linked or bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+    # Aseguramos conexión Color
+    if not bsdf.inputs['Base Color'].is_linked:
+        tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+    elif bsdf.inputs['Base Color'].links[0].from_node != tex_node:
+        # Si hay algo conectado que NO es nuestro nodo, lo reemplazamos
         tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
     
+    # Aseguramos conexión Alfa
     if 'Alpha' in bsdf.inputs:
-        if not bsdf.inputs['Alpha'].is_linked or bsdf.inputs['Alpha'].links[0].from_node != tex_node:
-            tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-
-def update_target_texture(self, context):
-    """
-    Callback: Aplica la imagen seleccionada al nodo de textura del 'target_material'.
-    Ya no iteramos objetos, modificamos directamente el material compartido.
-    """
-    target_img = self.target_image
-    mat = self.target_material # Usamos el material global seleccionado
+        if not bsdf.inputs['Alpha'].is_linked:
+             tree.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
     
-    if not target_img or not mat: return
-    
-    # --- Configuración de Nodos del Material ---
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    
-    # 1. Buscar o Crear Principled BSDF
-    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    if not bsdf:
-        nodes.clear() # Limpiamos si estaba sucio
-        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        bsdf.location = (0, 0)
-        out = nodes.new('ShaderNodeOutputMaterial')
-        out.location = (300, 0)
-        links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    
-    # 2. Buscar o Crear Nodo de Imagen
-    tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
-    if not tex_node:
-        tex_node = nodes.new('ShaderNodeTexImage')
-        tex_node.location = (-300, 200)
-    
-    # 3. Asignar Imagen y Configurar
-    tex_node.image = target_img
-    tex_node.interpolation = 'Closest' # Pixel Art style
-    
-    # 4. Conectar
-    if 'Base Color' in bsdf.inputs:
-        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-    if 'Alpha' in bsdf.inputs:
-        links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+    for obj in target_meshes:
+        obj.update_tag()
         
     # 5. Configurar Transparencia
     mat.blend_method = 'CLIP'
@@ -290,7 +362,7 @@ class HytaleProperties(bpy.types.PropertyGroup):
         name="Textura del Modelo",
         type=bpy.types.Image,
         description="Selecciona la imagen/textura que usará este modelo",
-        update=update_target_texture
+        update=update_material_texture
     )
     # ---------------------------------------
 
@@ -438,66 +510,3 @@ def draw_uv_stats_callback(self, context):
                     else:
                         loops_uv = [l[uv_layer] for l in face.loops]
                         if all(l.select for l in loops_uv): is_face_selected = True
-                    
-                    if not is_face_selected: continue
-
-                    uvs = [l[uv_layer].uv for l in face.loops]
-                    if not uvs: continue
-                    
-                    min_u, max_u = min(u.x for u in uvs), max(u.x for u in uvs)
-                    min_v, max_v = min(u.y for u in uvs), max(u.y for u in uvs)
-                    
-                    w_px = (max_u - min_u) * tex_w
-                    h_px = (max_v - min_v) * tex_h
-
-                    cx_center, cy_center = uv_to_region((min_u + max_u)/2, (min_v + max_v)/2)
-                    dist_target = ((cx_center - target_x)**2 + (cy_center - target_y)**2)**0.5
-
-                    cx_w, cy_w = uv_to_region((min_u + max_u)/2, min_v)
-                    cx_h, cy_h = uv_to_region(min_u, (min_v + max_v)/2)
-
-                    unique_id = (obj.name, 'FACE', face.index)
-                    if unique_id not in candidates: candidates[unique_id] = []
-                    candidates[unique_id].append( (dist_target, cx_w, cy_w, cx_h, cy_h, w_px, h_px) )
-
-        except Exception:
-            continue
-        finally:
-            if bm: bm.free()
-
-    # --- DIBUJADO FINAL ---
-    for uid, locations in candidates.items():
-        # Ordenamos por cercanía al último clic
-        locations.sort(key=lambda x: x[0])
-        best_match = locations[0]
-        
-        if uid[1] == 'EDGE':
-            _, sx, sy, text = best_match
-            blf.position(font_id, sx, sy, 0)
-            blf.draw(font_id, text)
-            
-        elif uid[1] == 'FACE':
-            _, cx_w, cy_w, cx_h, cy_h, w_px, h_px = best_match
-            blf.position(font_id, cx_w, cy_w - 20, 0)
-            blf.draw(font_id, f"W: {w_px:.1f}")
-            blf.position(font_id, cx_h - 50, cy_h, 0)
-            blf.draw(font_id, f"H: {h_px:.1f}")
-
-class OPS_OT_ToggleUVMeasures(bpy.types.Operator):
-    """Activa medidas UV, Sync, Modo Caras y Selecciona Todo"""
-    bl_idname = "hytale.toggle_uv_measures"
-    bl_label = "Ver Medidas UV (Full Setup)"
-    
-    def force_uv_redraw(self, context):
-        for window in context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'IMAGE_EDITOR':
-                    area.tag_redraw()
-    
-    def modal(self, context, event):
-        global uv_measures_running, last_click_abs_x, last_click_abs_y, draw_handle_uv_stats
-        
-        if not uv_measures_running:
-            if draw_handle_uv_stats:
-                bpy.types.SpaceImageEditor.draw_handler_remove(draw_handle_uv_stats, 'WINDOW')
-                draw_handle_uv_stats = None

@@ -1,6 +1,68 @@
 # PARTE 2/5 - hytaleModdingTools.py
 # CAMBIOS RECIENTES
 
+
+                # visual_mirror_u: al movernos hacia la derecha en 3D (lx aumenta),
+                # ¿disminuye U? => mirror horizontal visual
+                visual_mirror_u = (a_u < -EPS_J)
+                # visual_mirror_v: al movernos hacia arriba en 3D (ly aumenta),
+                # ¿disminuye V? => mirror vertical visual
+                visual_mirror_v = (b_v < -EPS_J)
+
+                # Si la matriz tiene determinante negativo => inversión global detectable.
+                if detJ < 0 and not (visual_mirror_u or visual_mirror_v):
+                    # elegimos el eje con mayor influencia absoluta (heurística)
+                    influence_u = abs(a_u) + abs(b_u)
+                    influence_v = abs(a_v) + abs(b_v)
+                    if influence_u >= influence_v:
+                        visual_mirror_u = True
+                    else:
+                        visual_mirror_v = True
+            else:
+                # fallback a heurística por extremos si la matriz es casi singular
+                left_v = min(proj_verts, key=lambda p: p['lx'])
+                right_v = max(proj_verts, key=lambda p: p['lx'])
+                bottom_v = min(proj_verts, key=lambda p: p['ly'])
+                top_v = max(proj_verts, key=lambda p: p['ly'])
+
+                visual_mirror_u = (left_v['uv'].x > right_v['uv'].x + 1e-6)
+                visual_mirror_v = (bottom_v['uv'].y > top_v['uv'].y + 1e-6)
+
+        # ------------------------------------------------------------
+        # 5. MAPEO A JSON (Intercambio de Ejes)
+        # ------------------------------------------------------------
+        json_mirror_x = False
+        json_mirror_y = False
+        
+        if angle == 90 or angle == 270:
+            # Cruzado
+            json_mirror_x = visual_mirror_v
+            json_mirror_y = visual_mirror_u
+        else:
+            # Directo
+            json_mirror_x = visual_mirror_u
+            json_mirror_y = visual_mirror_v
+
+        # 6. CÁLCULO DEL OFFSET (Matemática Inversa Exacta)
+        u_controlled_by_mirror = json_mirror_y if (angle == 90 or angle == 270) else json_mirror_x
+        v_controlled_by_mirror = json_mirror_x if (angle == 90 or angle == 270) else json_mirror_y
+
+        # Empezamos en la esquina superior izquierda visual
+        json_offset_x = x_left
+        json_offset_y = y_top
+        
+        # Dimensiones para sumar
+        dim_u = width_px 
+        dim_v = height_px 
+        
+        # REGLAS DE ROTACIÓN (Sumamos al offset para compensar la resta del importador)
+        if angle == 90:
+            json_offset_x += dim_u 
+        elif angle == 180:
+            json_offset_x += dim_u
+            json_offset_y += dim_v
+        elif angle == 270:
+            json_offset_y += dim_v
             
         # REGLAS DE ESPEJO (Si hay mirror, el pivote se mueve al final)
         if visual_mirror_u:
@@ -27,44 +89,50 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     
     # NUEVO: Detección de Stretch
     # Usamos la escala del objeto como stretch.
-    # Redondeamos a 4 decimales para evitar 1.0000001
     stretch_x = round(sca.x, 4)
     stretch_y = round(sca.z, 4) # Blender Z es Hytale Y
     stretch_z = round(sca.y, 4) # Blender Y es Hytale Z
     
-    has_stretch = (stretch_x != 1.0 or stretch_y != 1.0 or stretch_z != 1.0)
+    # [CORRECCIÓN SOLICITADA]: "poner stretch 1 en las mallas que se exporten con scale 1"
+    # Aseguramos que si el valor es 1.0, se quede como 1.0 en el objeto stretch.
+    # (El código anterior tal vez intentaba optimizarlo a 0 o borrarlo).
     
     if obj.type == 'MESH' and len(obj.data.vertices) > 0:
-        # [CAMBIO CRÍTICO]: Obtenemos dimensiones BASADAS EN VÉRTICES (Sin escala de objeto)
         verts = [v.co for v in obj.data.vertices]
         min_v = mathutils.Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
         max_v = mathutils.Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
-        
-        # Dimensiones puras de la malla (Raw mesh data)
-        # NO multiplicamos por obj.scale aquí.
         
         local_center = (min_v + max_v) / 2.0
         final_dims = mathutils.Vector((abs(max_v.x - min_v.x), abs(max_v.y - min_v.y), abs(max_v.z - min_v.z)))
         has_geometry = True
 
-    # --- Normalize name: strip Blender auto-suffixes like ".001", ".002" ---
+    # --- Normalize name ---
     base_name = re.sub(r'\.\d+$', '', obj.name)
     final_name = base_name
     if final_name in RESERVED_NAMES:
         final_name = final_name + "_Geo"
 
-    node_data = {
-        "id": str(id_counter[0]),
-        "name": final_name,
-        "position": blender_to_hytale_pos(loc),      
-        "orientation": blender_to_hytale_quat(rot),  
-        "children": [],
-        "shape": {"type": "none"} 
+    # Definir estructura Shape COMPLETA por defecto
+    hytale_shape = {
+        "type": "none",
+        "offset": {"x": 0, "y": 0, "z": 0},
+        # Aquí asignamos directamente los valores de stretch (sean 1 o lo que sean)
+        "stretch": {
+            "x": stretch_x,
+            "y": stretch_y,
+            "z": stretch_z
+        },
+        "settings": {
+            "isPiece": False
+        },
+        "textureLayout": {},
+        "unwrapMode": "custom",
+        "visible": True,
+        "doubleSided": False,
+        "shadingMode": "flat"
     }
-    id_counter[0] += 1
 
     def get_hytale_size(val, do_snap):
-        # Escala Global fija (16.0) para convertir metros a unidades bloque
         scaled = val * FIXED_GLOBAL_SCALE
         if do_snap:
             return int(round(scaled))
@@ -73,40 +141,22 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
     if has_geometry:
         is_plane = (final_dims.x < 0.001) or (final_dims.y < 0.001) or (final_dims.z < 0.001)
         
-        # El offset de la forma (shape offset) debe tener en cuenta que 
-        # local_center está en espacio sin escalar.
-        # Si aplicamos stretch en Hytale, el offset interno también se estira.
-        # Por lo general, Hytale aplica el stretch desde el centro del pivote.
         shape_offset = blender_to_hytale_pos(local_center)
-        
-        # Extraemos UVs (La función nueva)
         texture_layout = extract_uvs(obj, out_w, out_h, snap_to_pixels=snap_uvs)
-
         hytale_normal = None
         
-        # Lógica Box vs Quad
         if is_plane:
-            # (Tu lógica de Quads existente, ajustada a get_hytale_size sin obj.scale)
+            # QUAD LOGIC
             if final_dims.x < 0.001: 
                 hytale_normal = "+X"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.y, snap_uvs), 
-                    "y": get_hytale_size(final_dims.z, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.y, snap_uvs), "y": get_hytale_size(final_dims.z, snap_uvs) }
             elif final_dims.z < 0.001: 
                 hytale_normal = "+Y"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.x, snap_uvs), 
-                    "y": get_hytale_size(final_dims.y, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.x, snap_uvs), "y": get_hytale_size(final_dims.y, snap_uvs) }
             else: 
                 hytale_normal = "+Z"
-                filtered_size = {
-                    "x": get_hytale_size(final_dims.x, snap_uvs), 
-                    "y": get_hytale_size(final_dims.z, snap_uvs)
-                }
+                filtered_size = { "x": get_hytale_size(final_dims.x, snap_uvs), "y": get_hytale_size(final_dims.z, snap_uvs) }
             
-            # Validación de cara para Quads
             valid_face = None
             for k, v in texture_layout.items():
                 if v["offset"]["x"] != 0 or v["offset"]["y"] != 0 or v["angle"] != 0:
@@ -117,12 +167,13 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
             texture_layout = {"front": valid_face} if valid_face else {}
             
         else:
-            # Cuboides
+            # BOX LOGIC
             full_size = {
                 "x": get_hytale_size(final_dims.x, snap_uvs), 
                 "y": get_hytale_size(final_dims.z, snap_uvs), 
                 "z": get_hytale_size(final_dims.y, snap_uvs)
             }
+            # Filtrado de dimensiones 0
             filtered_size = {k: v for k, v in full_size.items() if v != 0}
             
             clean_layout = {}
@@ -130,30 +181,37 @@ def process_node(obj, out_w, out_h, snap_uvs, id_counter):
                 clean_layout[k] = v
             texture_layout = clean_layout
 
-        node_data["shape"] = {
-            "type": "quad" if is_plane else "box",
-            "offset": shape_offset,
-            "textureLayout": texture_layout,
-            "unwrapMode": "custom",
-            "settings": {
-                "isPiece": False,
-                "size": filtered_size,
-                "isStaticBox": True
-            },
-            "doubleSided": is_plane,
-            "shadingMode": "flat"
-        }
+        # Corrección estricta de Mirror
+        for face_name, face_data in texture_layout.items():
+            current_mirror = face_data.get("mirror", False)
+            if isinstance(current_mirror, bool):
+                face_data["mirror"] = {"x": current_mirror, "y": False}
+            elif isinstance(current_mirror, dict):
+                if "x" not in current_mirror: current_mirror["x"] = False
+                if "y" not in current_mirror: current_mirror["y"] = False
         
+        # Actualización de Shape
+        hytale_shape["type"] = "quad" if is_plane else "box"
+        hytale_shape["offset"] = shape_offset
+        hytale_shape["textureLayout"] = texture_layout
+        hytale_shape["settings"]["size"] = filtered_size
+        hytale_shape["doubleSided"] = is_plane
+        # Eliminamos isStaticBox si causaba problemas, o lo dejamos si es necesario para tu pipeline.
+        # En tu código de ejemplo lo habías comentado como FIX 3. Lo quito para seguridad.
+        # hytale_shape["settings"]["isStaticBox"] = True 
+
         if hytale_normal: 
-            node_data["shape"]["settings"]["normal"] = hytale_normal
-        
-        # [NUEVO] Inserción de propiedad 'stretch'
-        if has_stretch:
-            node_data["shape"]["stretch"] = {
-                "x": stretch_x,
-                "y": stretch_y,
-                "z": stretch_z
-            }
+            hytale_shape["settings"]["normal"] = hytale_normal
+
+    node_data = {
+        "id": str(id_counter[0]),
+        "name": final_name,
+        "position": blender_to_hytale_pos(loc),      
+        "orientation": blender_to_hytale_quat(rot),  
+        "children": [],
+        "shape": hytale_shape 
+    }
+    id_counter[0] += 1
 
     for child in obj.children:
         node_data["children"].append(process_node(child, out_w, out_h, snap_uvs, id_counter))
@@ -448,67 +506,3 @@ def apply_uvs_smart(face, bm, data, tex_w, tex_h, fw, fh):
         base_x -= size_u
     if v_is_mirrored:
         base_y -= size_v
-
-    # --- 5. CÁLCULO DE COORDENADAS ---
-    x_min = base_x
-    x_max = base_x + size_u
-    y_min = base_y
-    y_max = base_y + size_v
-    
-    # Aplicamos el espejo GEOMÉTRICAMENTE intercambiando límites.
-    # Esto ya deja la textura "al revés" en el eje correcto antes de rotar.
-    if u_is_mirrored:
-        u_left, u_right = x_max / tex_w, x_min / tex_w
-    else:
-        u_left, u_right = x_min / tex_w, x_max / tex_w
-        
-    if v_is_mirrored:
-        v_top = y_max / tex_h
-        v_bottom = y_min / tex_h
-    else:
-        v_top = y_min / tex_h
-        v_bottom = y_max / tex_h
-        
-    # Convertir a espacio Blender (1.0 - V)
-    vt = 1.0 - v_top
-    vb = 1.0 - v_bottom
-    
-    # Lista Base (TL, TR, BR, BL)
-    coords = [(u_left, vt), (u_right, vt), (u_right, vb), (u_left, vb)]
-
-    # --- 6. APLICAR ROTACIÓN (WINDING ORDER) ---
-    step = 0
-    if ang == 90: step = 1
-    elif ang == 180: step = 2
-    elif ang == 270: step = 3
-
-    # [CORRECCIÓN FINAL]: Eliminamos el "step += 2".
-    # Al haber calculado bien el "u_is_mirrored" y el "offset" arriba,
-    # la rotación estándar ya coloca cada vértice en su lugar.
-    # El "+2" anterior era lo que estaba causando el error de 180 grados.
-
-    step = step % 4
-    coords = coords[step:] + coords[:step]
-
-    # --- 7. MAPEO GEOMÉTRICO (ESTÁNDAR) ---
-    from mathutils import Vector
-    bmesh.ops.split_edges(bm, edges=face.edges)
-
-    normal = face.normal
-    center = face.calc_center_median()
-    epsilon = 0.9
-    
-    if normal.z > epsilon:    # TOP
-        ref_up = Vector((0, 1, 0)); ref_right = Vector((1, 0, 0))   
-    elif normal.z < -epsilon: # BOTTOM
-        ref_up = Vector((0, -1, 0)); ref_right = Vector((1, 0, 0))
-    elif normal.y > epsilon:  # BACK
-        ref_up = Vector((0, 0, 1)); ref_right = Vector((-1, 0, 0))
-    elif normal.y < -epsilon: # FRONT
-        ref_up = Vector((0, 0, 1)); ref_right = Vector((1, 0, 0))
-    elif normal.x > epsilon:  # RIGHT
-        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, 1, 0))
-    elif normal.x < -epsilon: # LEFT
-        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, -1, 0))
-    else: 
-        ref_up = Vector((0, 0, 1)); ref_right = ref_up.cross(normal)

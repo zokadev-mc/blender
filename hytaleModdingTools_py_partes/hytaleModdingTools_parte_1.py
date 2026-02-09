@@ -40,7 +40,7 @@ RESERVED_NAMES = {}
 # --- UTILIDADES GENERALES ---
 
 def standard_round(n):
-    return int(math.floor(n + 0.5))
+    return int(math.floor(n + 0.50001))
 
 def get_image_size_from_objects(objects):
     for obj in objects:
@@ -166,24 +166,72 @@ def draw_validator_ui(self, context, layout):
     negative_scale_objs = []
     no_mat_objs = []
     mesh_parent_mesh_objs = []
+    no_texture_connected_objs = []  # <-- nuevo: objetos cuyo material no tiene textura conectada
     
     for obj in collection.objects:
         if obj.type == 'MESH':
             # Checks
-            if obj.scale.x < 0 or obj.scale.y < 0 or obj.scale.z < 0: negative_scale_objs.append(obj.name)
-            if not obj.data.materials: no_mat_objs.append(obj.name)
-            if len(obj.data.vertices) > 8: complex_objs.append(obj.name)
-            if obj.parent and obj.parent.type == 'MESH': mesh_parent_mesh_objs.append(obj.name)
+            if obj.scale.x < 0 or obj.scale.y < 0 or obj.scale.z < 0:
+                negative_scale_objs.append(obj.name)
+            if not obj.data.materials:
+                no_mat_objs.append(obj.name)
+            if len(obj.data.vertices) > 8:
+                complex_objs.append(obj.name)
+            if obj.parent and obj.parent.type == 'MESH':
+                mesh_parent_mesh_objs.append(obj.name)
 
-    # Siblings check
+            # Check: textura conectada al material (si tiene materiales)
+            has_texture = False
+            if obj.data.materials:
+                # Recorremos todos los materiales asignados y consideramos OK si cualquiera tiene textura conectada
+                for mat in obj.data.materials:
+                    if not mat:
+                        continue
+                    if mat.use_nodes and mat.node_tree:
+                        # Buscar BSDF principled(s)
+                        bsdfs = [n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED']
+                        # Si no hay Principled, intentar detectar ImageTexture link a cualquier socket llamado "Base Color"
+                        if bsdfs:
+                            for bsdf in bsdfs:
+                                for link in mat.node_tree.links:
+                                    if link.to_node == bsdf and link.to_socket.name == 'Base Color':
+                                        # desde qué nodo viene el link
+                                        from_node = link.from_node
+                                        if getattr(from_node, "image", None) is not None:
+                                            has_texture = True
+                                            break
+                                if has_texture:
+                                    break
+                        else:
+                            # Fallback: buscar Image Texture con imagen y que tenga links salientes
+                            for node in mat.node_tree.nodes:
+                                if node.type == 'TEX_IMAGE' and getattr(node, "image", None) is not None:
+                                    # comprobar si ese nodo está conectado a algo (me interesa que vaya al BSDF)
+                                    for link in mat.node_tree.links:
+                                        if link.from_node == node:
+                                            # si enlaza a algo, asumimos que se usa como textura
+                                            has_texture = True
+                                            break
+                                    if has_texture:
+                                        break
+                    if has_texture:
+                        break
+
+            # Si tiene material(s) pero ninguna textura conectada -> reportar
+            if obj.data.materials and not has_texture:
+                no_texture_connected_objs.append(obj.name)
+
+    # Siblings check (mantengo tu lógica: detecta múltiples hijos compartiendo el mismo parent cuando el parent NO es mesh)
     siblings_issue = False
     parent_map = {}
     for obj in collection.objects:
         if obj.parent and obj.type == 'MESH':
             if obj.parent.type != 'MESH':
-                if obj.parent.name not in parent_map: parent_map[obj.parent.name] = 0
+                if obj.parent.name not in parent_map:
+                    parent_map[obj.parent.name] = 0
                 parent_map[obj.parent.name] += 1
-                if parent_map[obj.parent.name] > 1: siblings_issue = True
+                if parent_map[obj.parent.name] > 1:
+                    siblings_issue = True
 
     # Render
     if complex_objs:
@@ -192,7 +240,8 @@ def draw_validator_ui(self, context, layout):
         col.alert = True 
         col.label(text="Geometría Compleja (ERROR):", icon='CANCEL')
         col.label(text="(Modelo con vertices > 8 detectado.)", icon='BLANK1')
-        for name in complex_objs[:5]: col.label(text=f"• {name}", icon='MESH_DATA')
+        for name in complex_objs[:5]:
+            col.label(text=f"• {name}", icon='MESH_DATA')
         col.separator()
 
     if mesh_parent_mesh_objs:
@@ -209,7 +258,8 @@ def draw_validator_ui(self, context, layout):
         col = box.column(align=True)
         col.alert = True
         col.label(text="Escala Negativa (Caras invertidas):", icon='ERROR')
-        for name in negative_scale_objs[:3]: col.label(text=f"• {name}")
+        for name in negative_scale_objs[:3]:
+            col.label(text=f"• {name}")
         col.separator()
 
     if no_mat_objs:
@@ -217,11 +267,23 @@ def draw_validator_ui(self, context, layout):
         col = box.column(align=True)
         col.alert = True
         col.label(text="Falta Material/Textura:", icon='MATERIAL')
-        for name in no_mat_objs[:3]: col.label(text=f"• {name}")
+        for name in no_mat_objs[:3]:
+            col.label(text=f"• {name}")
+        col.separator()
+
+    # Nuevo bloque: materiales presentes pero sin textura conectada al Base Color
+    if no_texture_connected_objs:
+        issues_found = True
+        col = box.column(align=True)
+        col.alert = True
+        col.label(text="Textura no conectada al material:", icon='ERROR')
+        col.label(text="ACCIÓN: Conecta una Image Texture al Base Color del Principled BSDF.", icon='NODE_TEXTURE')
+        for name in no_texture_connected_objs[:5]:
+            col.label(text=f"• {name}", icon='MESH_DATA')
         col.separator()
 
     if siblings_issue:
-        issues_found = False
+        issues_found = True  # CORREGIDO: antes estaba en False y anulaba otros issues
         col = box.column(align=True)
         col.label(text="Jerarquía Múltiple (Empties)", icon='INFO')
         col.label(text="Se crearán Wrappers individuales.", icon='CHECKMARK')
@@ -439,65 +501,3 @@ def extract_uvs(obj, output_w, output_h, snap_to_pixels):
 
                 # Jacobiana 2x2: [[a_u, b_u], [a_v, b_v]]
                 detJ = (a_u * b_v - b_u * a_v)
-
-                # visual_mirror_u: al movernos hacia la derecha en 3D (lx aumenta),
-                # ¿disminuye U? => mirror horizontal visual
-                visual_mirror_u = (a_u < -EPS_J)
-                # visual_mirror_v: al movernos hacia arriba en 3D (ly aumenta),
-                # ¿disminuye V? => mirror vertical visual
-                visual_mirror_v = (b_v < -EPS_J)
-
-                # Si la matriz tiene determinante negativo => inversión global detectable.
-                if detJ < 0 and not (visual_mirror_u or visual_mirror_v):
-                    # elegimos el eje con mayor influencia absoluta (heurística)
-                    influence_u = abs(a_u) + abs(b_u)
-                    influence_v = abs(a_v) + abs(b_v)
-                    if influence_u >= influence_v:
-                        visual_mirror_u = True
-                    else:
-                        visual_mirror_v = True
-            else:
-                # fallback a heurística por extremos si la matriz es casi singular
-                left_v = min(proj_verts, key=lambda p: p['lx'])
-                right_v = max(proj_verts, key=lambda p: p['lx'])
-                bottom_v = min(proj_verts, key=lambda p: p['ly'])
-                top_v = max(proj_verts, key=lambda p: p['ly'])
-
-                visual_mirror_u = (left_v['uv'].x > right_v['uv'].x + 1e-6)
-                visual_mirror_v = (bottom_v['uv'].y > top_v['uv'].y + 1e-6)
-
-        # ------------------------------------------------------------
-        # 5. MAPEO A JSON (Intercambio de Ejes)
-        # ------------------------------------------------------------
-        json_mirror_x = False
-        json_mirror_y = False
-        
-        if angle == 90 or angle == 270:
-            # Cruzado
-            json_mirror_x = visual_mirror_v
-            json_mirror_y = visual_mirror_u
-        else:
-            # Directo
-            json_mirror_x = visual_mirror_u
-            json_mirror_y = visual_mirror_v
-
-        # 6. CÁLCULO DEL OFFSET (Matemática Inversa Exacta)
-        u_controlled_by_mirror = json_mirror_y if (angle == 90 or angle == 270) else json_mirror_x
-        v_controlled_by_mirror = json_mirror_x if (angle == 90 or angle == 270) else json_mirror_y
-
-        # Empezamos en la esquina superior izquierda visual
-        json_offset_x = x_left
-        json_offset_y = y_top
-        
-        # Dimensiones para sumar
-        dim_u = width_px 
-        dim_v = height_px 
-        
-        # REGLAS DE ROTACIÓN (Sumamos al offset para compensar la resta del importador)
-        if angle == 90:
-            json_offset_x += dim_u 
-        elif angle == 180:
-            json_offset_x += dim_u
-            json_offset_y += dim_v
-        elif angle == 270:
-            json_offset_y += dim_v

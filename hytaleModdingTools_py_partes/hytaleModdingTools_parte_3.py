@@ -2,6 +2,70 @@
 # CAMBIOS RECIENTES
 
 
+    # --- 5. CÁLCULO DE COORDENADAS ---
+    x_min = base_x
+    x_max = base_x + size_u
+    y_min = base_y
+    y_max = base_y + size_v
+    
+    # Aplicamos el espejo GEOMÉTRICAMENTE intercambiando límites.
+    # Esto ya deja la textura "al revés" en el eje correcto antes de rotar.
+    if u_is_mirrored:
+        u_left, u_right = x_max / tex_w, x_min / tex_w
+    else:
+        u_left, u_right = x_min / tex_w, x_max / tex_w
+        
+    if v_is_mirrored:
+        v_top = y_max / tex_h
+        v_bottom = y_min / tex_h
+    else:
+        v_top = y_min / tex_h
+        v_bottom = y_max / tex_h
+        
+    # Convertir a espacio Blender (1.0 - V)
+    vt = 1.0 - v_top
+    vb = 1.0 - v_bottom
+    
+    # Lista Base (TL, TR, BR, BL)
+    coords = [(u_left, vt), (u_right, vt), (u_right, vb), (u_left, vb)]
+
+    # --- 6. APLICAR ROTACIÓN (WINDING ORDER) ---
+    step = 0
+    if ang == 90: step = 1
+    elif ang == 180: step = 2
+    elif ang == 270: step = 3
+
+    # [CORRECCIÓN FINAL]: Eliminamos el "step += 2".
+    # Al haber calculado bien el "u_is_mirrored" y el "offset" arriba,
+    # la rotación estándar ya coloca cada vértice en su lugar.
+    # El "+2" anterior era lo que estaba causando el error de 180 grados.
+
+    step = step % 4
+    coords = coords[step:] + coords[:step]
+
+    # --- 7. MAPEO GEOMÉTRICO (ESTÁNDAR) ---
+    from mathutils import Vector
+    bmesh.ops.split_edges(bm, edges=face.edges)
+
+    normal = face.normal
+    center = face.calc_center_median()
+    epsilon = 0.9
+    
+    if normal.z > epsilon:    # TOP
+        ref_up = Vector((0, 1, 0)); ref_right = Vector((1, 0, 0))   
+    elif normal.z < -epsilon: # BOTTOM
+        ref_up = Vector((0, -1, 0)); ref_right = Vector((1, 0, 0))
+    elif normal.y > epsilon:  # BACK
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((-1, 0, 0))
+    elif normal.y < -epsilon: # FRONT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((1, 0, 0))
+    elif normal.x > epsilon:  # RIGHT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, 1, 0))
+    elif normal.x < -epsilon: # LEFT
+        ref_up = Vector((0, 0, 1)); ref_right = Vector((0, -1, 0))
+    else: 
+        ref_up = Vector((0, 0, 1)); ref_right = ref_up.cross(normal)
+
     for loop in face.loops:
         vert_vec = loop.vert.co - center
         dx = vert_vec.dot(ref_right)
@@ -119,85 +183,72 @@ def create_mesh_quad_import(name, shape_data, texture_width, texture_height):
     for v in mesh.vertices: v.co += off_h
     return mesh
 
-def process_node_import(node_data, parent_obj, texture_width, texture_height, collection):
+# Añadimos un argumento nuevo al final: inherited_offset
+def process_node_import(node_data, parent_obj, texture_width, texture_height, collection, inherited_offset=None):
+    if inherited_offset is None:
+        inherited_offset = mathutils.Vector((0, 0, 0))
+
     name = node_data.get("name", "Node")
-    pos = hytale_to_blender_pos(node_data.get("position", {}))
+    
+    # 1. Posición base (La que dice el archivo)
+    raw_pos = node_data.get("position", {})
+    pos = hytale_to_blender_pos(raw_pos)
     rot = hytale_to_blender_quat(node_data.get("orientation", {}))
     
-    # --- 1. CREAR EL NODO PRINCIPAL (PIVOTE) ---
+    # --- APLICAR LA CORRECCIÓN SOLO AL NODO ACTUAL (HIJO) ---
+    # Sumamos el offset que nos mandó el padre (si hubo alguno)
+    # El padre no se mueve, pero el hijo nace desplazado para coincidir con la malla del padre.
+    final_pos = pos + inherited_offset
+
+    # --- 2. CREAR EL NODO (PIVOTE) ---
     node_empty = bpy.data.objects.new(name, None)
     node_empty.empty_display_type = 'PLAIN_AXES'
     node_empty.empty_display_size = 0.2
     collection.objects.link(node_empty)
     
-    node_empty.location = pos
+    # Usamos la posición corregida
+    node_empty.location = final_pos
     node_empty.rotation_mode = 'QUATERNION'
     node_empty.rotation_quaternion = rot
     
-    # Emparentar el Empty al padre (si existe)
     if parent_obj:
         node_empty.parent = parent_obj
     
-    # --- PRE-VERIFICACIÓN DE HIJOS ---
-    children_list = node_data.get("children", [])
-    has_children = len(children_list) > 0
-
-    # --- 2. CREAR LA FORMA (MESH) ---
+    # --- 3. PREPARAR EL OFFSET PARA MIS PROPIOS HIJOS ---
+    # Leemos si este nodo actual tiene un offset visual (shape.offset)
     shape_data = node_data.get("shape", {})
-    shape_type = shape_data.get("type", "none")
+    raw_shape_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
+    current_node_visual_offset = hytale_to_blender_pos(raw_shape_offset)
     
+    # --- 4. CREAR LA MESH ---
+    # (Tu lógica de creación de mesh se mantiene casi igual, 
+    #  pero asegurándonos de aplicar el offset visual A LA MALLA localmente)
+    
+    shape_type = shape_data.get("type", "none")
     if shape_type != "none":
         st = shape_data.get("stretch", {'x': 1.0, 'y': 1.0, 'z': 1.0})
-        mesh_obj = None # Inicializamos la variable
-
-        if has_children:
-            # Lógica para jerarquía avanzada (Padre -> Wrapper -> Malla)
-            shape_copy = shape_data.copy()
-            shape_copy['offset'] = {'x': 0, 'y': 0, 'z': 0}
-
-            if shape_type == 'box':
-                mesh = create_mesh_box_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            else:
-                mesh = create_mesh_quad_import(name + "_mesh", shape_copy, texture_width, texture_height)
-            
-            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
-            collection.objects.link(mesh_obj)
-
-            # Calcular Offset para el Wrapper
-            raw_offset = shape_data.get("offset", {'x': 0, 'y': 0, 'z': 0})
-            target_pos = hytale_to_blender_pos(raw_offset)
-            
-            # Crear el Wrapper (Geo)
-            geo_wrapper = bpy.data.objects.new(name + "_Geo", None)
-            geo_wrapper.empty_display_type = 'PLAIN_AXES'
-            geo_wrapper.empty_display_size = 0.1
-            collection.objects.link(geo_wrapper)
-            
-            # EMPARENTAMIENTO EN CADENA
-            geo_wrapper.parent = node_empty
-            geo_wrapper.location = target_pos
-            mesh_obj.parent = geo_wrapper
-            
+        
+        # Aquí SÍ usamos el offset normal en la malla, porque el pivote de ESTE nodo 
+        # no se ha movido por su propio offset, sino por el del padre.
+        # Por tanto, la malla necesita su propio offset local.
+        if shape_type == 'box':
+            mesh = create_mesh_box_import(name, shape_data, texture_width, texture_height)
         else:
-            # Caso Normal: Malla directa al Empty
-            if shape_type == 'box':
-                mesh = create_mesh_box_import(name + "_mesh", shape_data, texture_width, texture_height)
-            else:
-                mesh = create_mesh_quad_import(name + "_mesh", shape_data, texture_width, texture_height)
-                
-            mesh_obj = bpy.data.objects.new(name + "_shape", mesh)
-            collection.objects.link(mesh_obj)
+            mesh = create_mesh_quad_import(name, shape_data, texture_width, texture_height)
             
-            # EMPARENTAMIENTO DIRECTO
-            mesh_obj.parent = node_empty
-            
-        # Aplicar escala (esto ahora se hace después de asegurar que mesh_obj existe)
-        if mesh_obj:
-            mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
+        mesh_obj = bpy.data.objects.new(name, mesh)
+        collection.objects.link(mesh_obj)
+        mesh_obj.parent = node_empty
+        mesh_obj.scale = (st.get('x', 1.0), st.get('z', 1.0), st.get('y', 1.0))
 
-    # --- 3. PROCESAR HIJOS ---
+    # --- 5. PROCESAR HIJOS RECURSIVAMENTE ---
+    children_list = node_data.get("children", [])
     for child in children_list:
-        process_node_import(child, node_empty, texture_width, texture_height, collection)
+        # AQUÍ ESTÁ LA MAGIA:
+        # Pasamos el 'current_node_visual_offset' a los hijos.
+        # Si este nodo (Handle) tenía un offset de 5, el hijo (Hammer) recibirá ese 5
+        # y se sumará a su posición.
+        process_node_import(child, node_empty, texture_width, texture_height, collection, inherited_offset=current_node_visual_offset)
         
     return node_empty
     
@@ -321,7 +372,8 @@ class OPS_OT_ExportHytale(bpy.types.Operator):
                 "nodes": nodes_array, 
                 "format": "character", 
                 "textureWidth": int(tex_w), 
-                "textureHeight": int(tex_h) 
+                "textureHeight": int(tex_h), 
+                "lod": "auto"
             }
             
             # --- BLOQUE OPTIMIZADO: Formato Compacto (Opción B) ---
@@ -451,55 +503,3 @@ class OPS_OT_ImportHytale(bpy.types.Operator, ImportHelper):
         except Exception as e:
             self.report({'ERROR'}, f"Error: {e}")
             return {'CANCELLED'}
-
-        # Lógica de resolución: Prioridad al menú, luego al JSON
-        tex_w = int(self.res_w) if self.res_w != '0' else data.get("textureWidth", 32)
-        tex_h = int(self.res_h) if self.res_h != '0' else data.get("textureHeight", 32)
-
-        model_name = os.path.splitext(os.path.basename(self.filepath))[0]
-        col = bpy.data.collections.new(model_name)
-        context.scene.collection.children.link(col)
-
-        # Iniciar importación recursiva
-        for node in data.get("nodes", []):
-            process_node_import(node, None, tex_w, tex_h, col)
-
-        self.report({'INFO'}, f"Importado con resolución: {tex_w}x{tex_h}")
-        return {'FINISHED'}
-
-class OPS_OT_PixelPerfectPack(bpy.types.Operator):
-    bl_idname = "hytale.pixel_perfect_pack"
-    bl_label = "Scale UV's To Pixel Perfect"
-    bl_description = "Alinea, escala y (opcionalmente) stackea UVs por intersección."
-
-    def execute(self, context):
-        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        if not selected_meshes:
-            self.report({'WARNING'}, "Selecciona al menos un objeto Mesh")
-            return {'CANCELLED'}
-
-        if context.object and context.object.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        context.view_layer.objects.active = selected_meshes[0]
-        bpy.ops.object.join()
-        main_obj = context.active_object
-        
-        # 1. Reconstrucción de orientación para cálculos precisos (también usa el FIX)
-        reconstruct_orientation_from_geometry(main_obj)
-        
-        props = context.scene.hytale_props
-        tex_w, tex_h = get_image_size_from_objects([main_obj])
-        if not tex_w: tex_w, tex_h = 32, 32
-
-        bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(main_obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
-        
-        # --- PASO 1: UNWRAP ---
-        bpy.ops.mesh.select_all(action='SELECT')
-        if props.new_unwrap:
-            try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001, correct_aspect=True)
-            except:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
